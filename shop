@@ -1,0 +1,185 @@
+from aiogram import Router
+from aiogram.types import Message
+from aiogram.filters import Command
+from sqlalchemy import select
+from database import async_session, User, get_or_create_user, Pet, InventoryItem
+import random
+
+router = Router()
+
+
+# --- Зоомагазин / питомцы ---
+@router.message(Command("магазин"))
+async def cmd_shop(message: Message):
+    text = (
+        "🛒 <b>Магазин</b>\n\n"
+        "1. Питомцы — <code>зоомагазин</code>\n"
+        "2. Зелья — <code>таверна</code>\n"
+        "3. VIP — <code>вип</code>\n"
+    )
+    await message.reply(text)
+
+
+@router.message(Command("зоомагазин"))
+async def cmd_pet_shop(message: Message):
+    text = (
+        "🐾 <b>Зоомагазин</b>\n\n"
+        "• Лисёнок Мики — <b>500</b> монеток / <b>50</b> сияний\n"
+        "  (стихия: огонь)\n\n"
+        "Чтобы купить: <code>+питомец</code>"
+    )
+    await message.reply(text)
+
+
+@router.message(Command("+питомец"))
+async def cmd_buy_pet(message: Message):
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        if user.coins < 500 or user.sparkles < 50:
+            return await message.reply("❌ Недостаточно средств (500💰 + 50✨).")
+        existing = await session.execute(
+            select(Pet).where(Pet.user_id == user.telegram_id)
+        )
+        if existing.scalar_one_or_none():
+            return await message.reply("❌ У вас уже есть питомец.")
+        user.coins -= 500
+        user.sparkles -= 50
+        pet = Pet(user_id=user.telegram_id, name="Мики", element="огонь")
+        session.add(pet)
+        await session.commit()
+    await message.reply("🐾 <b>Питомец Мики</b> куплен! Используйте <code>мой питомец</code>.")
+
+
+@router.message(Command("мой_питомец"))
+async def cmd_my_pet(message: Message):
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        result = await session.execute(select(Pet).where(Pet.user_id == user.telegram_id))
+        pet = result.scalar_one_or_none()
+        if not pet:
+            return await message.reply("❌ У вас нет питомца. Купите в <code>зоомагазин</code>.")
+        text = (
+            f"🐾 <b>{pet.name}</b>\n"
+            f"Стихия: <b>{pet.element}</b>\n"
+            f"Уровень: <b>{pet.level}</b> / 20\n"
+            f"❤️ HP: <b>{pet.health}</b>/{pet.max_health}\n"
+            f"⚡ Энергия: <b>{pet.energy}</b>/{pet.max_energy}\n"
+            f"⚔️ Атака: <b>{pet.attack}</b>\n"
+            f"🛡 Защита: <b>{pet.defense}</b>"
+        )
+        await message.reply(text)
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("+кличка "))
+async def cmd_pet_name(message: Message):
+    name = message.text[9:].strip()
+    if not name:
+        return await message.reply("Введите имя: <code>+кличка НовоеИмя</code>")
+    async with async_session() as session:
+        result = await session.execute(select(Pet).where(Pet.user_id == message.from_user.id))
+        pet = result.scalar_one_or_none()
+        if not pet:
+            return await message.reply("❌ У вас нет питомца.")
+        pet.name = name[:30]
+        await session.commit()
+    await message.reply(f"✅ Питомец теперь зовётся <b>{name}</b>!")
+
+
+@router.message(Command("лазарет"))
+async def cmd_lazaret(message: Message):
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        result = await session.execute(select(Pet).where(Pet.user_id == user.telegram_id))
+        pet = result.scalar_one_or_none()
+        if not pet:
+            return await message.reply("❌ У вас нет питомца.")
+        cost = 50
+        if user.coins < cost:
+            return await message.reply(f"❌ Нужно <b>{cost}</b> монеток.")
+        user.coins -= cost
+        pet.health = pet.max_health
+        pet.energy = pet.max_energy
+        await session.commit()
+    await message.reply("🚑 <b>Лазарет:</b> питомец полностью вылечен!")
+
+
+# --- Инвентарь / зелья ---
+@router.message(Command("мой_инвентарь"))
+async def cmd_inventory(message: Message):
+    async with async_session() as session:
+        result = await session.execute(
+            select(InventoryItem).where(InventoryItem.user_id == message.from_user.id)
+        )
+        items = result.scalars().all()
+        if not items:
+            return await message.reply("🎒 Инвентарь пуст.")
+        text = "🎒 <b>Инвентарь:</b>\n\n"
+        for it in items:
+            text += f"• {it.item_name}: <b>{it.quantity}</b>\n"
+        await message.reply(text)
+
+
+@router.message(Command("таверна"))
+async def cmd_tavern(message: Message):
+    text = (
+        "🧪 <b>Таверна ведьмы</b>\n\n"
+        "• Плод любви — <b>100</b> сияний\n"
+        "  Использование: <code>свести пару @user1 @user2</code>\n\n"
+        "Чтобы купить, используйте <code>+зелье [название]</code>"
+    )
+    await message.reply(text)
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("+зелье "))
+async def cmd_buy_potion(message: Message):
+    name = message.text[7:].strip().lower()
+    prices = {"плод любви": 100}
+    if name not in prices:
+        return await message.reply("Такого зелья нет.")
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        if user.sparkles < prices[name]:
+            return await message.reply("❌ Недостаточно сияний.")
+        user.sparkles -= prices[name]
+        # добавляем в инвентарь
+        inv = await session.execute(
+            select(InventoryItem).where(
+                InventoryItem.user_id == user.telegram_id,
+                InventoryItem.item_name == name
+            )
+        )
+        item = inv.scalar_one_or_none()
+        if item:
+            item.quantity += 1
+        else:
+            item = InventoryItem(user_id=user.telegram_id, item_name=name, quantity=1)
+            session.add(item)
+        await session.commit()
+    await message.reply(f"🧪 <b>{name}</b> куплено!")
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("свести пару "))
+async def cmd_love_potion(message: Message):
+    # свести пару @user1 @user2
+    parts = message.text.split()
+    if len(parts) < 4:
+        return await message.reply("Формат: свести пару @user1 @user2")
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        inv = await session.execute(
+            select(InventoryItem).where(
+                InventoryItem.user_id == user.telegram_id,
+                InventoryItem.item_name == "плод любви"
+            )
+        )
+        item = inv.scalar_one_or_none()
+        if not item or item.quantity <= 0:
+            return await message.reply("❌ Нужно зелье 'Плод любви'. Купите в таверне.")
+        item.quantity -= 1
+        if item.quantity == 0:
+            await session.delete(item)
+        await session.commit()
+    await message.reply(
+        f"💘 <b>Плод любви</b> использован!\n\n"
+        f"Пользователи {parts[2]} и {parts[3]} теперь в браке! (упрощённо)"
+    )
