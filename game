@@ -1,0 +1,629 @@
+from aiogram import Router, F, Bot
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command
+from sqlalchemy import select
+from database import async_session, get_or_create_user, GameState, Theft, is_robbed
+from config import (
+    CASINO_MAX_BET_DEFAULT, VIP_CASINO_MAX_BET,
+    MIKI_MAX_BET_DEFAULT, VIP_MIKI_MAX_BET,
+    CASINO_COOLDOWN_SECONDS, VIP_CASINO_COOLDOWN_SECONDS
+)
+import random
+import json
+from datetime import datetime, timedelta
+
+router = Router()
+
+
+async def can_play_async(user, bet: int, max_bet: int):
+    if bet <= 0:
+        return False, "Ставка должна быть больше 0."
+    if bet > max_bet:
+        return False, f"Максимальная ставка: {max_bet} монеток."
+    if user.coins < bet:
+        return False, "❌ Недостаточно монеток."
+    return True, ""
+
+
+async def check_robbed(user_id: int):
+    async with async_session() as session:
+        return await is_robbed(session, user_id)
+
+
+# --- Монетка ---
+@router.message(Command("монетка"))
+async def cmd_coin(message: Message):
+    result = random.choice(["🦅 Орёл", "🪙 Решка"])
+    await message.reply(f"🪙 Монетка подброшена...\n\n<b>{result}</b>!")
+
+
+# --- Новый год ---
+@router.message(lambda msg: msg.text and "новый год" in msg.text.lower())
+async def cmd_newyear(message: Message):
+    now = datetime.utcnow()
+    next_year = datetime(now.year + 1, 1, 1)
+    if now.month == 1 and now.day == 1:
+        return await message.reply("🎉 С Новым Годом! Уже наступил!")
+    diff = next_year - now
+    d = diff.days
+    h = diff.seconds // 3600
+    m = (diff.seconds % 3600) // 60
+    await message.reply(f"🎄 До Нового Года: <b>{d}д {h}ч {m}м</b>.")
+
+
+# --- Кубик ---
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("кубик "))
+async def cmd_dice(message: Message):
+    parts = message.text.split()
+    if len(parts) < 2:
+        return await message.reply("Использование: кубик <ставка>")
+    try:
+        bet = int(parts[1])
+    except ValueError:
+        return
+    if await check_robbed(message.from_user.id):
+        return await message.reply("❌ На вас нападают! Нельзя играть.")
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        ok, err = await can_play_async(user, bet, 999_999_999)
+        if not ok:
+            return await message.reply(err)
+        u = random.randint(1, 6)
+        b = random.randint(1, 6)
+        if u > b:
+            user.coins += bet
+            res = f"🎉 Вы выиграли! +{bet} монеток"
+        elif u == b:
+            res = "😐 Ничья. Ставка возвращена."
+        else:
+            user.coins -= bet
+            res = f"😞 Проигрыш. -{bet} монеток"
+        await session.commit()
+        await message.reply(
+            f"🎲 Ваш бросок: <b>{u}</b>\n🤖 Бот бросил: <b>{b}</b>\n\n{res}"
+        )
+
+
+# --- КНБ ---
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("кнб"))
+async def cmd_rps(message: Message):
+    parts = message.text.lower().split()
+    wins = 3
+    bet = 0
+    if parts:
+        base = parts[0]
+        if base.startswith("кнб") and len(base) > 3:
+            try:
+                wins = int(base[3:])
+            except ValueError:
+                wins = 3
+    if wins < 1:
+        wins = 1
+    if wins > 5:
+        wins = 5
+    if len(parts) >= 2:
+        try:
+            bet = int(parts[1])
+        except ValueError:
+            bet = 0
+    if await check_robbed(message.from_user.id):
+        return await message.reply("❌ На вас нападают! Нельзя играть.")
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        if bet > 0:
+            ok, err = await can_play_async(user, bet, 999_999_999)
+            if not ok:
+                return await message.reply(err)
+        uw = 0
+        bw = 0
+        history = []
+        while uw < wins and bw < wins:
+            pc = random.choice(["камень", "ножницы", "бумага"])
+            bc = random.choice(["камень", "ножницы", "бумага"])
+            if pc == bc:
+                history.append(f"😐 Ничья ({pc})")
+                continue
+            if (pc == "камень" and bc == "ножницы") or \
+               (pc == "ножницы" and bc == "бумага") or \
+               (pc == "бумага" and bc == "камень"):
+                uw += 1
+                history.append(f"✅ Раунд за вами ({pc} vs {bc})")
+            else:
+                bw += 1
+                history.append(f"❌ Раунд за ботом ({pc} vs {bc})")
+        if bet > 0:
+            if uw > bw:
+                prize = bet * (wins - bw)
+                user.coins += prize
+                res = f"🎉 Победа! Приз: +{prize} монеток"
+            else:
+                user.coins -= bet
+                res = f"😞 Проигрыш. -{bet} монеток"
+        else:
+            res = "Игра окончена!"
+        await session.commit()
+        text = f"🎮 Камень-Ножницы-Бумага (до {wins} побед)\n" + "\n".join(history) + f"\n\n{res}"
+        await message.reply(text)
+
+
+# --- Казино: Зов ---
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("зов "))
+async def cmd_zov(message: Message):
+    parts = message.text.split()
+    if len(parts) < 2:
+        return
+    try:
+        bet = int(parts[1])
+    except ValueError:
+        return
+    if await check_robbed(message.from_user.id):
+        return await message.reply("❌ На вас нападают! Нельзя играть.")
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        max_bet = VIP_CASINO_MAX_BET if user.vip else CASINO_MAX_BET_DEFAULT
+        ok, err = await can_play_async(user, bet, max_bet)
+        if not ok:
+            return await message.reply(err)
+        now = datetime.utcnow()
+        cd_res = await session.execute(
+            select(GameState).where(
+                GameState.user_id == user.telegram_id,
+                GameState.game_type == "casino_cooldown"
+            )
+        )
+        cd = cd_res.scalar_one_or_none()
+        cooldown_sec = VIP_CASINO_COOLDOWN_SECONDS if user.vip else CASINO_COOLDOWN_SECONDS
+        if cd:
+            last = json.loads(cd.state_data).get("last", 0)
+            if (now.timestamp() - last) < cooldown_sec:
+                left = int(cooldown_sec - (now.timestamp() - last))
+                return await message.reply(f"⏳ Подождите ещё {left} сек.")
+        if random.random() < 0.45:
+            win = bet * 2
+            user.coins += win
+            result = f"🎰 Джекпот! Вы выиграли <b>{win}</b> монеток!"
+        else:
+            user.coins -= bet
+            result = f"😞 Вы проиграли <b>{bet}</b> монеток."
+        if not cd:
+            cd = GameState(
+                user_id=user.telegram_id, game_type="casino_cooldown",
+                state_data=json.dumps({"last": now.timestamp()})
+            )
+            session.add(cd)
+        else:
+            cd.state_data = json.dumps({"last": now.timestamp()})
+        await session.commit()
+        await message.reply(result)
+
+
+# --- Рулетка ---
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("рулетка "))
+async def cmd_roulette(message: Message):
+    parts = message.text.split()
+    if len(parts) < 2:
+        return
+    try:
+        bet = int(parts[1])
+    except ValueError:
+        return
+    if await check_robbed(message.from_user.id):
+        return await message.reply("❌ На вас нападают! Нельзя играть.")
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        max_bet = VIP_CASINO_MAX_BET if user.vip else CASINO_MAX_BET_DEFAULT
+        ok, err = await can_play_async(user, bet, max_bet)
+        if not ok:
+            return await message.reply(err)
+        emojis = ["🍒", "🍋", "🍇", "💎", "👎"]
+        roll = [random.choice(emojis) for _ in range(3)]
+        txt = " | ".join(roll)
+        if roll[0] == roll[1] == roll[2]:
+            if roll[0] == "👎":
+                user.coins -= bet
+                res = f"\n\n👎 Три 👎! Вы проиграли <b>{bet}</b>."
+            else:
+                win = bet * 2
+                user.coins += win
+                res = f"\n\n🎉 Три одинаковых! Выигрыш <b>{win}</b>! (x2)"
+        elif roll[0] == roll[1] or roll[1] == roll[2] or roll[0] == roll[2]:
+            if "👎" in roll:
+                user.coins -= bet
+                res = f"\n\n👎 Есть 👎! Вы проиграли <b>{bet}</b>."
+            else:
+                win = int(bet * 1.5)
+                user.coins += win
+                res = f"\n\n✨ Два одинаковых! Выигрыш <b>{win}</b>! (x1.5)"
+        else:
+            user.coins -= bet
+            if "👎" in roll:
+                res = f"\n\n👎 Вы проиграли <b>{bet}</b>."
+            else:
+                res = f"\n\n😞 Нет совпадений. Проигрыш <b>{bet}</b>."
+        await session.commit()
+        await message.reply(f"🎰 <b>Рулетка</b>\n\n{txt}{res}")
+
+
+# --- Мики (3 двери) ---
+async def start_miki_game(session, user, bet, message):
+    board = [True, True, False]
+    random.shuffle(board)
+    state = {"type": "miki", "bet": bet, "level": 1, "board": board, "alive": True}
+    gs = GameState(user_id=user.telegram_id, game_type="miki", state_data=json.dumps(state), bet=bet)
+    session.add(gs)
+    await session.commit()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚪 1", callback_data="miki:0"),
+         InlineKeyboardButton(text="🚪 2", callback_data="miki:1"),
+         InlineKeyboardButton(text="🚪 3", callback_data="miki:2")]
+    ])
+    await message.reply(
+        f"🦊 <b>Спаси Мики!</b> Уровень 1/5\nСтавка: {bet}\nВыберите дверь:", reply_markup=kb
+    )
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("мики "))
+async def cmd_miki(message: Message):
+    parts = message.text.split()
+    if len(parts) < 2:
+        return
+    try:
+        bet = int(parts[1])
+    except ValueError:
+        return
+    if await check_robbed(message.from_user.id):
+        return await message.reply("❌ На вас нападают! Нельзя играть.")
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        max_bet = VIP_MIKI_MAX_BET if user.vip else MIKI_MAX_BET_DEFAULT
+        ok, err = await can_play_async(user, bet, max_bet)
+        if not ok:
+            return await message.reply(err)
+        user.coins -= bet
+        await session.commit()
+        await start_miki_game(session, user, bet, message)
+
+
+@router.callback_query(F.data.startswith("miki:"))
+async def cb_miki(callback: CallbackQuery):
+    idx = int(callback.data.split(":")[1])
+    async with async_session() as session:
+        result = await session.execute(
+            select(GameState).where(
+                GameState.user_id == callback.from_user.id,
+                GameState.game_type == "miki"
+            )
+        )
+        gs = result.scalar_one_or_none()
+        if not gs:
+            return await callback.answer("Игра не найдена.")
+        state = json.loads(gs.state_data)
+        if not state["alive"]:
+            return await callback.answer("Игра окончена.")
+        board = state["board"]
+        if board[idx]:
+            state["level"] += 1
+            if state["level"] > 5:
+                prize = int(gs.bet * 5)
+                user = await get_or_create_user(session, callback.from_user.id)
+                user.coins += prize
+                await session.delete(gs)
+                await session.commit()
+                await callback.message.edit_text(
+                    f"🎉 <b>Победа!</b> Вы спасли Мики на всех уровнях!\n💰 Приз: <b>{prize}</b> монеток!"
+                )
+                return await callback.answer("Победа!")
+            new_board = [True, True, False]
+            random.shuffle(new_board)
+            state["board"] = new_board
+            gs.state_data = json.dumps(state)
+            await session.commit()
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🚪 1", callback_data="miki:0"),
+                 InlineKeyboardButton(text="🚪 2", callback_data="miki:1"),
+                 InlineKeyboardButton(text="🚪 3", callback_data="miki:2")]
+            ])
+            await callback.message.edit_text(
+                f"🦊 Мики спасена! Уровень {state['level']}/5\nВыберите дверь:", reply_markup=kb
+            )
+            return await callback.answer("Отлично!")
+        else:
+            state["alive"] = False
+            gs.state_data = json.dumps(state)
+            await session.commit()
+            await callback.message.edit_text("🐺 <b>Волк!</b> Он вас съел... 😢\nСтавка сгорела.")
+            return await callback.answer("Проигрыш!")
+
+
+# --- Прятки (5x5) ---
+def build_hide_kb(state):
+    board = state["board"]
+    opened = state["opened"]
+    kb = []
+    for row in range(5):
+        r = []
+        for col in range(5):
+            idx = row * 5 + col
+            if idx in opened:
+                val = board[str(idx)]
+                txt = {"phantom": "🦊", "sun": "☀", "empty": "⭐"}[val]
+                r.append(InlineKeyboardButton(text=txt, callback_data="hide:none"))
+            else:
+                r.append(InlineKeyboardButton(text="❓", callback_data=f"hide:{idx}"))
+        kb.append(r)
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("прятки "))
+async def cmd_hide(message: Message):
+    parts = message.text.split()
+    if len(parts) < 2:
+        return
+    try:
+        bet = int(parts[1])
+    except ValueError:
+        return
+    if await check_robbed(message.from_user.id):
+        return await message.reply("❌ На вас нападают! Нельзя играть.")
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        max_bet = VIP_MIKI_MAX_BET if user.vip else MIKI_MAX_BET_DEFAULT
+        ok, err = await can_play_async(user, bet, max_bet)
+        if not ok:
+            return await message.reply(err)
+        user.coins -= bet
+        phantoms = random.randint(1, 5)
+        cells = list(range(25))
+        random.shuffle(cells)
+        p_cells = set(cells[:phantoms])
+        s_cells = set(cells[phantoms:phantoms + random.randint(1, 3)])
+        board = {}
+        for i in range(25):
+            if i in p_cells:
+                board[str(i)] = "phantom"
+            elif i in s_cells:
+                board[str(i)] = "sun"
+            else:
+                board[str(i)] = "empty"
+        state = {
+            "type": "hide", "bet": bet, "board": board,
+            "found": 0, "total": phantoms, "opened": [], "alive": True
+        }
+        gs = GameState(user_id=user.telegram_id, game_type="hide", state_data=json.dumps(state), bet=bet)
+        session.add(gs)
+        await session.commit()
+        kb = build_hide_kb(state)
+        await message.reply(
+            f"🙈 <b>Прятки с Мики!</b>\nНайдите <b>{phantoms}</b> фантомов на поле 5×5!\n"
+            f"⭐ - пусто, ☀ - опасно, 🦊 - фантом\nСтавка: {bet}", reply_markup=kb
+        )
+
+
+@router.callback_query(F.data.startswith("hide:"))
+async def cb_hide(callback: CallbackQuery):
+    data = callback.data.split(":")[1]
+    if data == "none":
+        return await callback.answer()
+    idx = int(data)
+    async with async_session() as session:
+        result = await session.execute(
+            select(GameState).where(
+                GameState.user_id == callback.from_user.id,
+                GameState.game_type == "hide"
+            )
+        )
+        gs = result.scalar_one_or_none()
+        if not gs:
+            return await callback.answer("Игра не найдена.")
+        state = json.loads(gs.state_data)
+        if not state["alive"]:
+            return await callback.answer("Игра окончена.")
+        if idx in state["opened"]:
+            return await callback.answer("Уже открыто.")
+        state["opened"].append(idx)
+        cell = state["board"][str(idx)]
+        user = await get_or_create_user(session, callback.from_user.id)
+        if cell == "sun":
+            state["alive"] = False
+            gs.state_data = json.dumps(state)
+            await session.commit()
+            await callback.message.edit_text("☀ <b>Солнце!</b> Вы проиграли... 😢")
+            return await callback.answer("Проигрыш!")
+        elif cell == "phantom":
+            state["found"] += 1
+            if state["found"] >= state["total"]:
+                prize = int(gs.bet * (2 + state["total"]))
+                user.coins += prize
+                await session.delete(gs)
+                await session.commit()
+                await callback.message.edit_text(
+                    f"🦊 <b>Все фантомы найдены!</b>\n💰 Приз: <b>{prize}</b> монеток!"
+                )
+                return await callback.answer("Победа!")
+        gs.state_data = json.dumps(state)
+        await session.commit()
+        kb = build_hide_kb(state)
+        rem = state["total"] - state["found"]
+        await callback.message.edit_text(
+            f"🙈 <b>Прятки с Мики!</b>\nОсталось найти: <b>{rem}</b>\n"
+            f"Открыто: {len(state['opened'])}/25", reply_markup=kb
+        )
+        return await callback.answer("Продолжаем!")
+
+
+# --- Космический бой (КБ) - упрощённая версия ---
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("кб "))
+async def cmd_space(message: Message):
+    parts = message.text.split()
+    if len(parts) < 2:
+        return await message.reply("Использование: кб <ставка>")
+    try:
+        bet = int(parts[1])
+    except ValueError:
+        return
+    if await check_robbed(message.from_user.id):
+        return await message.reply("❌ На вас нападают! Нельзя играть.")
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        ok, err = await can_play_async(user, bet, 500_000)
+        if not ok:
+            return await message.reply(err)
+        user_ships = 6
+        bot_ships = 6
+        log = []
+        while user_ships > 0 and bot_ships > 0:
+            if random.random() < 0.5:
+                bot_ships -= 1
+                log.append("🚀 Вы уничтожили корабль противника!")
+            else:
+                log.append("❌ Вы промахнулись.")
+            if bot_ships <= 0:
+                break
+            if random.random() < 0.45:
+                user_ships -= 1
+                log.append("💥 Противник уничтожил ваш корабль!")
+            else:
+                log.append("🛡 Противник промахнулся.")
+        if user_ships > 0:
+            prize = bet * 3
+            user.coins += prize
+            res = f"🎉 <b>Победа в космосе!</b>\n💰 Приз: <b>{prize}</b> монеток"
+        else:
+            user.coins -= bet
+            res = f"😞 <b>Поражение.</b>\nПотеряно: <b>{bet}</b> монеток"
+        await session.commit()
+        text = "🌌 <b>Космический бой</b>\n\n" + "\n".join(log[-10:]) + "\n\n" + res
+        await message.reply(text)
+
+
+# --- Кейсы ---
+@router.message(Command("кейсы"))
+async def cmd_cases(message: Message):
+    if await check_robbed(message.from_user.id):
+        return await message.reply("❌ На вас нападают! Нельзя открывать кейсы.")
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        now = datetime.utcnow()
+        from database import Cooldown
+        cd_res = await session.execute(
+            select(Cooldown).where(Cooldown.user_id == user.telegram_id, Cooldown.command == "case")
+        )
+        cd = cd_res.scalar_one_or_none()
+        if cd and cd.expires_at > now:
+            left = cd.expires_at - now
+            m = int(left.total_seconds() // 60)
+            return await message.reply(f"⏳ Кейс доступен через {m} мин.")
+        prize = random.choice([
+            ("coins", random.randint(100, 5000)),
+            ("sparkles", random.randint(10, 100)),
+            ("diamonds", random.randint(1, 5)),
+            ("nothing", 0)
+        ])
+        if prize[0] == "coins":
+            user.coins += prize[1]
+            text = f"🎁 <b>Кейс!</b>\n\n💰 Монеток: <b>+{prize[1]}</b>"
+        elif prize[0] == "sparkles":
+            user.sparkles += prize[1]
+            text = f"🎁 <b>Кейс!</b>\n\n✨ Сияний: <b>+{prize[1]}</b>"
+        elif prize[0] == "diamonds":
+            user.diamonds += prize[1]
+            text = f"🎁 <b>Кейс!</b>\n\n💎 Алмазов: <b>+{prize[1]}</b>"
+        else:
+            text = "🎁 <b>Кейс пуст...</b>\n\n😞 Удача не на вашей стороне."
+        if not cd:
+            cd = Cooldown(user_id=user.telegram_id, command="case", expires_at=now + timedelta(hours=3))
+            session.add(cd)
+        else:
+            cd.expires_at = now + timedelta(hours=3)
+        await session.commit()
+        await message.reply(text)
+
+
+# --- Воровство ---
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("украсть"))
+async def cmd_steal(message: Message):
+    if not message.reply_to_message:
+        return await message.reply("Ответьте на сообщение жертвы.")
+    target_id = message.reply_to_message.from_user.id
+    if target_id == message.from_user.id:
+        return await message.reply("❌ Нельзя воровать у себя.")
+    async with async_session() as session:
+        thief = await get_or_create_user(session, message.from_user.id)
+        target = await get_or_create_user(session, target_id)
+        if thief.daggers < 1:
+            return await message.reply("❌ Нужен хотя бы 1 кинжал.")
+        existing = await session.execute(
+            select(Theft).where(Theft.target_id == target_id, Theft.active == True)
+        )
+        if existing.scalar_one_or_none():
+            return await message.reply("❌ У этой цели уже идёт ограбление.")
+        if random.random() < 0.5:
+            stolen = min(random.randint(100, 500), target.coins)
+            if stolen > 0:
+                target.coins -= stolen
+                thief.coins += stolen
+                thief.daggers -= 1
+                await session.commit()
+                await message.reply(
+                    f"🗡 <b>Успешное ограбление!</b>\n"
+                    f"Вы украли <b>{stolen}</b> монеток у {message.reply_to_message.from_user.full_name}."
+                )
+            else:
+                thief.daggers -= 1
+                await session.commit()
+                await message.reply("🗡 У жертвы нет монет. Кинжал потрачен.")
+        else:
+            thief.daggers -= 1
+            theft = Theft(thief_id=thief.telegram_id, target_id=target_id, chat_id=message.chat.id, active=True)
+            session.add(theft)
+            await session.commit()
+            await message.reply(
+                "🗡 <b>Ограбление провалено!</b>\n"
+                "Жертва заметила вас и начала оборону. Кинжал потрачен.\n"
+                "Жертва не может играть/передавать, пока не отобьётся."
+            )
+
+
+@router.message(Command("нападения"))
+async def cmd_attacks(message: Message):
+    async with async_session() as session:
+        result = await session.execute(
+            select(Theft).where(Theft.target_id == message.from_user.id, Theft.active == True)
+        )
+        thefts = result.scalars().all()
+        if not thefts:
+            return await message.reply("🔒 На вас нет активных нападений.")
+        text = "⚠️ <b>Активные нападения:</b>\n\n"
+        for t in thefts:
+            thief = await get_or_create_user(session, t.thief_id)
+            text += f"• {thief.first_name or 'User'} (чат {t.chat_id})\n"
+        text += "\nОтветьте на сообщение вора и отправьте <code>пистолет</code>, чтобы отбиться."
+        await message.reply(text)
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().strip() == "пистолет")
+async def cmd_defend(message: Message):
+    if not message.reply_to_message:
+        return await message.reply("Ответьте на сообщение вора, чтобы отбиться.")
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        if user.pistols < 1:
+            return await message.reply("❌ Нужен пистолет.")
+        thief_id = message.reply_to_message.from_user.id
+        result = await session.execute(
+            select(Theft).where(
+                Theft.thief_id == thief_id,
+                Theft.target_id == message.from_user.id,
+                Theft.active == True
+            )
+        )
+        theft = result.scalar_one_or_none()
+        if not theft:
+            return await message.reply("❌ Этот пользователь не грабит вас.")
+        user.pistols -= 1
+        theft.active = False
+        await session.commit()
+        await message.reply(
+            "🔫 <b>Вы отбились!</b>\n"
+            "Пистолет спас вас. Теперь вы можете играть и переводить валюту."
+        )
