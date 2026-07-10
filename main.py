@@ -7,8 +7,9 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from config import BOT_TOKEN
 from database import init_db
 from handlers import (
-    common_router, owner_router, currency_router, games_router, marriage_router,
-    profile_router, rp_router, shop_router, admin_router, inline_router
+    common_router, owner_router, currency_router, games_router, cars_router,
+    marriage_router, profile_router, rp_router, shop_router, admin_router,
+    moderation_router, inline_router
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -24,11 +25,13 @@ async def main():
         owner_router,
         currency_router,
         games_router,
+        cars_router,
         marriage_router,
         profile_router,
         rp_router,
         shop_router,
         admin_router,
+        moderation_router,
         inline_router,
     )
 
