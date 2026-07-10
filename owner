@@ -1,0 +1,210 @@
+from aiogram import Router, Bot
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command
+from sqlalchemy import select
+from database import async_session, User, get_or_create_user
+from config import OWNER_USERNAME
+
+router = Router()
+
+
+def is_owner(message: Message) -> bool:
+    return bool(message.from_user and message.from_user.username == OWNER_USERNAME)
+
+
+def owner_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💰 Выдать валюту", callback_data="owner:currency")],
+        [InlineKeyboardButton(text="🗡 Выдать предметы", callback_data="owner:items")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="owner:stats")],
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="owner:broadcast")],
+    ])
+
+
+@router.message(Command("owner"))
+async def cmd_owner(message: Message):
+    if not is_owner(message):
+        return
+    await message.answer("🎛 <b>Консоль владельца</b>", reply_markup=owner_kb())
+
+
+@router.callback_query(lambda c: c.data == "owner:back")
+async def cb_back(callback: CallbackQuery):
+    if callback.from_user.username != OWNER_USERNAME:
+        return await callback.answer("❌ Нет доступа", show_alert=True)
+    await callback.message.edit_text("🎛 <b>Консоль владельца</b>", reply_markup=owner_kb())
+
+
+@router.callback_query(lambda c: c.data == "owner:currency")
+async def cb_currency(callback: CallbackQuery):
+    if callback.from_user.username != OWNER_USERNAME:
+        return await callback.answer("❌")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Монетки", callback_data="give:coins")],
+        [InlineKeyboardButton(text="Сияния Мики", callback_data="give:sparkles")],
+        [InlineKeyboardButton(text="Алмазы", callback_data="give:diamonds")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="owner:back")],
+    ])
+    await callback.message.edit_text("💰 Выберите валюту для выдачи:", reply_markup=kb)
+
+
+@router.callback_query(lambda c: c.data == "owner:items")
+async def cb_items(callback: CallbackQuery):
+    if callback.from_user.username != OWNER_USERNAME:
+        return await callback.answer("❌")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Кинжалы", callback_data="give:daggers")],
+        [InlineKeyboardButton(text="Пистолеты", callback_data="give:pistols")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="owner:back")],
+    ])
+    await callback.message.edit_text("🗡 Выберите предмет для выдачи:", reply_markup=kb)
+
+
+@router.callback_query(lambda c: c.data == "owner:stats")
+async def cb_stats(callback: CallbackQuery):
+    if callback.from_user.username != OWNER_USERNAME:
+        return await callback.answer("❌")
+    async with async_session() as session:
+        result = await session.execute(select(User))
+        users = result.scalars().all()
+        total = len(users)
+        total_coins = sum(u.coins for u in users)
+        total_sparkles = sum(u.sparkles for u in users)
+        total_diamonds = sum(u.diamonds for u in users)
+    text = (
+        f"📊 <b>Статистика бота</b>\n\n"
+        f"👤 Пользователей: <b>{total}</b>\n"
+        f"💰 Монеток в обороте: <b>{total_coins}</b>\n"
+        f"✨ Сияний в обороте: <b>{total_sparkles}</b>\n"
+        f"💎 Алмазов в обороте: <b>{total_diamonds}</b>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀ Назад", callback_data="owner:back")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb)
+
+
+@router.callback_query(lambda c: c.data == "owner:broadcast")
+async def cb_broadcast(callback: CallbackQuery):
+    if callback.from_user.username != OWNER_USERNAME:
+        return await callback.answer("❌")
+    await callback.message.edit_text(
+        "📢 Отправьте сообщение в ответ на это, и я разошлю его всем пользователям.\n"
+        "Или используйте команду <code>/broadcast текст</code>"
+    )
+
+
+# Команды выдачи (через reply)
+@router.message(Command("givecoins"))
+async def cmd_give_coins(message: Message):
+    if not is_owner(message):
+        return
+    args = message.text.split()
+    if len(args) < 2 or not message.reply_to_message:
+        return await message.reply("Ответьте на сообщение пользователя: <code>/givecoins 1000</code>")
+    try:
+        amount = int(args[1])
+    except ValueError:
+        return await message.reply("Введите число.")
+    target_id = message.reply_to_message.from_user.id
+    async with async_session() as session:
+        user = await get_or_create_user(session, target_id)
+        user.coins += amount
+        await session.commit()
+    await message.reply(f"✅ Выдано <b>{amount}</b> монеток пользователю.")
+
+
+@router.message(Command("givesparkles"))
+async def cmd_give_sparkles(message: Message):
+    if not is_owner(message):
+        return
+    args = message.text.split()
+    if len(args) < 2 or not message.reply_to_message:
+        return await message.reply("Ответьте на сообщение: <code>/givesparkles 1000</code>")
+    try:
+        amount = int(args[1])
+    except ValueError:
+        return await message.reply("Введите число.")
+    target_id = message.reply_to_message.from_user.id
+    async with async_session() as session:
+        user = await get_or_create_user(session, target_id)
+        user.sparkles += amount
+        await session.commit()
+    await message.reply(f"✅ Выдано <b>{amount}</b> Сияний Мики.")
+
+
+@router.message(Command("givediamonds"))
+async def cmd_give_diamonds(message: Message):
+    if not is_owner(message):
+        return
+    args = message.text.split()
+    if len(args) < 2 or not message.reply_to_message:
+        return await message.reply("Ответьте на сообщение: <code>/givediamonds 1000</code>")
+    try:
+        amount = int(args[1])
+    except ValueError:
+        return await message.reply("Введите число.")
+    target_id = message.reply_to_message.from_user.id
+    async with async_session() as session:
+        user = await get_or_create_user(session, target_id)
+        user.diamonds += amount
+        await session.commit()
+    await message.reply(f"✅ Выдано <b>{amount}</b> алмазов.")
+
+
+@router.message(Command("givedaggers"))
+async def cmd_give_daggers(message: Message):
+    if not is_owner(message):
+        return
+    args = message.text.split()
+    if len(args) < 2 or not message.reply_to_message:
+        return await message.reply("Ответьте на сообщение: <code>/givedaggers 10</code>")
+    try:
+        amount = int(args[1])
+    except ValueError:
+        return await message.reply("Введите число.")
+    target_id = message.reply_to_message.from_user.id
+    async with async_session() as session:
+        user = await get_or_create_user(session, target_id)
+        user.daggers += amount
+        await session.commit()
+    await message.reply(f"✅ Выдано <b>{amount}</b> кинжалов.")
+
+
+@router.message(Command("givepistols"))
+async def cmd_give_pistols(message: Message):
+    if not is_owner(message):
+        return
+    args = message.text.split()
+    if len(args) < 2 or not message.reply_to_message:
+        return await message.reply("Ответьте на сообщение: <code>/givepistols 10</code>")
+    try:
+        amount = int(args[1])
+    except ValueError:
+        return await message.reply("Введите число.")
+    target_id = message.reply_to_message.from_user.id
+    async with async_session() as session:
+        user = await get_or_create_user(session, target_id)
+        user.pistols += amount
+        await session.commit()
+    await message.reply(f"✅ Выдано <b>{amount}</b> пистолетов.")
+
+
+@router.message(Command("broadcast"))
+async def cmd_broadcast(message: Message, bot: Bot):
+    if not is_owner(message):
+        return
+    text = message.text.replace("/broadcast", "").strip()
+    if not text:
+        return await message.reply("Введите текст после команды.")
+    async with async_session() as session:
+        result = await session.execute(select(User.telegram_id).distinct())
+        ids = [r[0] for r in result.all()]
+    count = 0
+    for uid in ids:
+        try:
+            await bot.send_message(uid, f"📢 <b>Сообщение от администрации:</b>\n\n{text}")
+            count += 1
+        except Exception:
+            pass
+    await message.reply(f"✅ Разослано <b>{count}</b> пользователям.")
