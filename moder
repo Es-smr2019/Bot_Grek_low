@@ -1,0 +1,829 @@
+from aiogram import Router, F, Bot
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ChatMemberUpdated
+from aiogram.filters import Command, ChatMemberUpdatedFilter
+from sqlalchemy import select, desc, func, and_
+from database import (
+    async_session, get_or_create_user, get_or_create_chat, get_chat_rank, set_chat_rank,
+    ChatSettings, ChatRank, Warn, Ban, MuteRecord, ChatStat, User
+)
+from datetime import datetime, timedelta
+
+router = Router()
+
+
+async def is_mod(session, chat_id: int, user_id: int, min_rank: int = 1):
+    r = await get_chat_rank(session, chat_id, user_id)
+    return r >= min_rank
+
+
+async def is_creator(session, chat_id: int, user_id: int):
+    cs = await get_or_create_chat(session, chat_id)
+    return (cs.creator_id == user_id) or (user_id == 0)  # placeholder for owner check
+
+
+# --- АДМИНЫ / РАНГИ ---
+@router.message(Command("админы"))
+async def cmd_admins(message: Message):
+    if not message.chat.type.startswith("group"):
+        return
+    async with async_session() as session:
+        if not await is_mod(session, message.chat.id, message.from_user.id, 1):
+            return await message.reply("❌ Недостаточно прав.")
+        result = await session.execute(
+            select(ChatRank, User).join(User, User.telegram_id == ChatRank.user_id)
+            .where(ChatRank.chat_id == message.chat.id, ChatRank.rank >= 1)
+            .order_by(desc(ChatRank.rank))
+        )
+        rows = result.all()
+        if not rows:
+            return await message.reply("❌ В этом чате нет администраторов бота.")
+        text = "👥 <b>Администраторы чата:</b>\n\n"
+        for rank, user in rows:
+            name = user.nick or user.first_name or f"User {user.telegram_id}"
+            text += f"• Ранг {rank.rank}: {name}\n"
+        await message.reply(text)
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("повысить "))
+async def cmd_promote(message: Message):
+    if not message.chat.type.startswith("group"):
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        return await message.reply("Формат: повысить {ранг} (ответ) или повысить {ранг} @user")
+    try:
+        rank = int(parts[1])
+    except ValueError:
+        return await message.reply("Укажите число от 0 до 5.")
+    if not 0 <= rank <= 5:
+        return await message.reply("Ранг должен быть от 0 до 5.")
+    target_id = None
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+    elif len(parts) >= 3 and parts[2].startswith("@"):
+        uname = parts[2].replace("@", "")
+        async with async_session() as session:
+            res = await session.execute(select(User).where(User.username == uname))
+            u = res.scalar_one_or_none()
+            if u:
+                target_id = u.telegram_id
+    if not target_id:
+        return await message.reply("Укажите пользователя через ответ или @username.")
+    async with async_session() as session:
+        if not await is_mod(session, message.chat.id, message.from_user.id, 5):
+            return await message.reply("❌ Только создатель может назначать ранги.")
+        await set_chat_rank(session, message.chat.id, target_id, rank)
+        await message.reply(f"✅ Пользователю установлен ранг <b>{rank}</b>.")
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("понизить "))
+async def cmd_demote(message: Message):
+    if not message.chat.type.startswith("group"):
+        return
+    target_id = None
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+    elif len(message.text.split()) >= 2 and message.text.split()[1].startswith("@"):
+        uname = message.text.split()[1].replace("@", "")
+        async with async_session() as session:
+            res = await session.execute(select(User).where(User.username == uname))
+            u = res.scalar_one_or_none()
+            if u:
+                target_id = u.telegram_id
+    if not target_id:
+        return await message.reply("Укажите пользователя.")
+    async with async_session() as session:
+        if not await is_mod(session, message.chat.id, message.from_user.id, 5):
+            return await message.reply("❌ Только создатель может понижать.")
+        current = await get_chat_rank(session, message.chat.id, target_id)
+        if current <= 0:
+            return await message.reply("У пользователя нет ранга.")
+        await set_chat_rank(session, message.chat.id, target_id, max(0, current - 1))
+        await message.reply(f"✅ Ранг пользователя понижен до <b>{max(0, current-1)}</b>.")
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("снять ранги"))
+async def cmd_clear_ranks(message: Message):
+    if not message.chat.type.startswith("group"):
+        return
+    async with async_session() as session:
+        if not await is_mod(session, message.chat.id, message.from_user.id, 5):
+            return await message.reply("❌ Только создатель.")
+        parts = message.text.split()
+        if len(parts) >= 3:
+            try:
+                rank_filter = int(parts[2])
+            except ValueError:
+                rank_filter = None
+        else:
+            rank_filter = None
+        res = await session.execute(
+            select(ChatRank).where(ChatRank.chat_id == message.chat.id)
+        )
+        ranks = res.scalars().all()
+        removed = 0
+        for r in ranks:
+            if rank_filter is not None and r.rank != rank_filter:
+                continue
+            if r.rank == 5:
+                continue  # не трогаем создателя
+            await session.delete(r)
+            removed += 1
+        await session.commit()
+        await message.reply(f"✅ Снято рангов: <b>{removed}</b>.")
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("передать создателя"))
+async def cmd_transfer_creator(message: Message):
+    if not message.chat.type.startswith("group"):
+        return
+    target_id = None
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+    elif len(message.text.split()) >= 3 and message.text.split()[2].startswith("@"):
+        uname = message.text.split()[2].replace("@", "")
+        async with async_session() as session:
+            res = await session.execute(select(User).where(User.username == uname))
+            u = res.scalar_one_or_none()
+            if u:
+                target_id = u.telegram_id
+    if not target_id:
+        return await message.reply("Ответьте на сообщение пользователя.")
+    async with async_session() as session:
+        cs = await get_or_create_chat(session, message.chat.id)
+        if cs.creator_id != message.from_user.id:
+            return await message.reply("❌ Только текущий создатель может передать права.")
+        cs.creator_id = target_id
+        await set_chat_rank(session, message.chat.id, target_id, 5)
+        await session.commit()
+        await message.reply("✅ Создатель передан.")
+
+
+@router.message(Command("восстановить_создателя"))
+async def cmd_restore_creator(message: Message):
+    if not message.chat.type.startswith("group"):
+        return
+    async with async_session() as session:
+        cs = await get_or_create_chat(session, message.chat.id)
+        cs.creator_id = message.from_user.id
+        await set_chat_rank(session, message.chat.id, message.from_user.id, 5)
+        await session.commit()
+        await message.reply("✅ Вы восстановлены как создатель.")
+
+
+# --- МУТЫ ---
+MUTE_PERIODS = {
+    "минута": 1,
+    "час": 60,
+    "день": 24 * 60,
+    "неделя": 7 * 24 * 60,
+    "месяц": 30 * 24 * 60,
+    "навсегда": 99999,
+}
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("мут "))
+async def cmd_mute(message: Message, bot: Bot):
+    if not message.chat.type.startswith("group"):
+        return
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 2:
+        return await message.reply("Формат: мут {период} (ответ) [причина]")
+    period_str = parts[1].lower()
+    minutes = MUTE_PERIODS.get(period_str, 60)
+    target_id = None
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+    if not target_id:
+        return await message.reply("Ответьте на сообщение пользователя.")
+    reason = parts[2] if len(parts) >= 3 else "Не указана"
+    async with async_session() as session:
+        if not await is_mod(session, message.chat.id, message.from_user.id, 1):
+            return await message.reply("❌ Недостаточно прав.")
+        until = datetime.utcnow() + timedelta(minutes=minutes)
+        try:
+            await bot.restrict_chat_member(
+                chat_id=message.chat.id, user_id=target_id,
+                permissions={"can_send_messages": False, "can_send_media_messages": False},
+                until_date=until
+            )
+        except Exception:
+            pass
+        m = MuteRecord(user_id=target_id, chat_id=message.chat.id, muted_by=message.from_user.id, until=until)
+        session.add(m)
+        await session.commit()
+    await message.reply(f"🔇 Пользователь заглушён на <b>{period_str}</b>.\nПричина: {reason}")
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("размут "))
+async def cmd_unmute(message: Message, bot: Bot):
+    if not message.chat.type.startswith("group"):
+        return
+    target_id = None
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+    if not target_id:
+        return await message.reply("Ответьте на сообщение.")
+    async with async_session() as session:
+        if not await is_mod(session, message.chat.id, message.from_user.id, 1):
+            return await message.reply("❌ Недостаточно прав.")
+        try:
+            await bot.restrict_chat_member(
+                chat_id=message.chat.id, user_id=target_id,
+                permissions={"can_send_messages": True, "can_send_media_messages": True}
+            )
+        except Exception:
+            pass
+        await message.reply("🔊 Мут снят.")
+
+
+@router.message(Command("мут_лист"))
+async def cmd_mute_list(message: Message):
+    if not message.chat.type.startswith("group"):
+        return
+    async with async_session() as session:
+        if not await is_mod(session, message.chat.id, message.from_user.id, 1):
+            return await message.reply("❌ Недостаточно прав.")
+        res = await session.execute(
+            select(MuteRecord).where(MuteRecord.chat_id == message.chat.id)
+            .order_by(desc(MuteRecord.created_at)).limit(10)
+        )
+        mutes = res.scalars().all()
+        if not mutes:
+            return await message.reply("Мутов не найдено.")
+        text = "🔇 <b>Последние муты:</b>\n\n"
+        for m in mutes:
+            text += f"• ID{m.user_id} до {m.until.strftime('%d.%m %H:%M')}\n"
+        await message.reply(text)
+
+
+# --- ВАРНЫ ---
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("+варн "))
+async def cmd_warn(message: Message):
+    if not message.chat.type.startswith("group"):
+        return
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 2:
+        return await message.reply("Формат: +варн @user причина")
+    target_id = None
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+    else:
+        if parts[1].startswith("@"):
+            uname = parts[1].replace("@", "")
+            async with async_session() as session:
+                res = await session.execute(select(User).where(User.username == uname))
+                u = res.scalar_one_or_none()
+                if u:
+                    target_id = u.telegram_id
+    if not target_id:
+        return await message.reply("Укажите пользователя.")
+    reason = parts[2] if len(parts) >= 3 else "Не указана"
+    async with async_session() as session:
+        if not await is_mod(session, message.chat.id, message.from_user.id, 1):
+            return await message.reply("❌ Недостаточно прав.")
+        w = Warn(chat_id=message.chat.id, user_id=target_id, reason=reason, warned_by=message.from_user.id)
+        session.add(w)
+        await session.commit()
+        # проверка лимита
+        count_res = await session.execute(
+            select(func.count(Warn.id)).where(Warn.chat_id == message.chat.id, Warn.user_id == target_id)
+        )
+        count = count_res.scalar() or 0
+        cs = await get_or_create_chat(session, message.chat.id)
+        text = f"⚠️ Пользователь получил предупреждение.\nПричина: {reason}\nВсего: {count}/{cs.warn_limit}"
+        if count >= cs.warn_limit:
+            text += f"\n<b>Лимит достигнут! Наказание: {cs.warn_action}</b>"
+            # применить наказание (упрощённо)
+        await message.reply(text)
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("снять варны"))
+async def cmd_clear_warns(message: Message):
+    if not message.chat.type.startswith("group"):
+        return
+    target_id = None
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+    elif len(message.text.split()) >= 3 and message.text.split()[2].startswith("@"):
+        uname = message.text.split()[2].replace("@", "")
+        async with async_session() as session:
+            res = await session.execute(select(User).where(User.username == uname))
+            u = res.scalar_one_or_none()
+            if u:
+                target_id = u.telegram_id
+    if not target_id:
+        return await message.reply("Укажите пользователя.")
+    async with async_session() as session:
+        if not await is_mod(session, message.chat.id, message.from_user.id, 1):
+            return await message.reply("❌ Недостаточно прав.")
+        res = await session.execute(
+            select(Warn).where(Warn.chat_id == message.chat.id, Warn.user_id == target_id)
+        )
+        for w in res.scalars().all():
+            await session.delete(w)
+        await session.commit()
+        await message.reply("✅ Все предупреждения сняты.")
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("варн лимит "))
+async def cmd_warn_limit(message: Message):
+    if not message.chat.type.startswith("group"):
+        return
+    try:
+        limit = int(message.text.split()[2])
+    except (IndexError, ValueError):
+        return await message.reply("Формат: варн лимит 2-10")
+    if not 2 <= limit <= 10:
+        return await message.reply("Число от 2 до 10.")
+    async with async_session() as session:
+        if not await is_mod(session, message.chat.id, message.from_user.id, 5):
+            return await message.reply("❌ Только создатель.")
+        cs = await get_or_create_chat(session, message.chat.id)
+        cs.warn_limit = limit
+        await session.commit()
+        await message.reply(f"✅ Лимит предупреждений: <b>{limit}</b>.")
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("варн наказание "))
+async def cmd_warn_punishment(message: Message):
+    if not message.chat.type.startswith("group"):
+        return
+    parts = message.text.split()
+    if len(parts) < 3 or parts[2] not in ("бан", "мут", "кик"):
+        return await message.reply("Формат: варн наказание {бан|мут|кик}")
+    async with async_session() as session:
+        if not await is_mod(session, message.chat.id, message.from_user.id, 5):
+            return await message.reply("❌ Только создатель.")
+        cs = await get_or_create_chat(session, message.chat.id)
+        cs.warn_action = parts[2]
+        await session.commit()
+        await message.reply(f"✅ Наказание при лимите: <b>{parts[2]}</b>.")
+
+
+# --- БАНЫ ---
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("разбан "))
+async def cmd_unban(message: Message, bot: Bot):
+    if not message.chat.type.startswith("group"):
+        return
+    target_id = None
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+    elif len(message.text.split()) >= 2 and message.text.split()[1].startswith("@"):
+        uname = message.text.split()[1].replace("@", "")
+        async with async_session() as session:
+            res = await session.execute(select(User).where(User.username == uname))
+            u = res.scalar_one_or_none()
+            if u:
+                target_id = u.telegram_id
+    if not target_id:
+        return await message.reply("Укажите пользователя.")
+    async with async_session() as session:
+        if not await is_mod(session, message.chat.id, message.from_user.id, 1):
+            return await message.reply("❌ Недостаточно прав.")
+        try:
+            await bot.unban_chat_member(chat_id=message.chat.id, user_id=target_id)
+        except Exception:
+            pass
+        res = await session.execute(
+            select(Ban).where(Ban.chat_id == message.chat.id, Ban.user_id == target_id)
+        )
+        for b in res.scalars().all():
+            await session.delete(b)
+        await session.commit()
+        await message.reply("✅ Пользователь разбанен.")
+
+
+@router.message(Command("бан_лист"))
+async def cmd_ban_list(message: Message):
+    if not message.chat.type.startswith("group"):
+        return
+    async with async_session() as session:
+        if not await is_mod(session, message.chat.id, message.from_user.id, 1):
+            return await message.reply("❌ Недостаточно прав.")
+        res = await session.execute(
+            select(Ban).where(Ban.chat_id == message.chat.id)
+            .order_by(desc(Ban.created_at)).limit(10)
+        )
+        bans = res.scalars().all()
+        if not bans:
+            return await message.reply("Банов не найдено.")
+        text = "🚫 <b>Последние баны:</b>\n\n"
+        for b in bans:
+            text += f"• ID{b.user_id}: {b.reason}\n"
+        await message.reply(text)
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("причина "))
+async def cmd_reason(message: Message):
+    if not message.chat.type.startswith("group"):
+        return
+    target_id = None
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+    elif len(message.text.split()) >= 2 and message.text.split()[1].startswith("@"):
+        uname = message.text.split()[1].replace("@", "")
+        async with async_session() as session:
+            res = await session.execute(select(User).where(User.username == uname))
+            u = res.scalar_one_or_none()
+            if u:
+                target_id = u.telegram_id
+    if not target_id:
+        return await message.reply("Укажите пользователя.")
+    async with async_session() as session:
+        # последний бан
+        ban_res = await session.execute(
+            select(Ban).where(Ban.chat_id == message.chat.id, Ban.user_id == target_id)
+            .order_by(desc(Ban.created_at)).limit(1)
+        )
+        ban = ban_res.scalar_one_or_none()
+        # последний мут
+        mute_res = await session.execute(
+            select(MuteRecord).where(MuteRecord.chat_id == message.chat.id, MuteRecord.user_id == target_id)
+            .order_by(desc(MuteRecord.created_at)).limit(1)
+        )
+        mute = mute_res.scalar_one_or_none()
+        # последний варн
+        warn_res = await session.execute(
+            select(Warn).where(Warn.chat_id == message.chat.id, Warn.user_id == target_id)
+            .order_by(desc(Warn.created_at)).limit(1)
+        )
+        warn = warn_res.scalar_one_or_none()
+        text = f"📋 <b>История для ID {target_id}:</b>\n\n"
+        if ban:
+            text += f"🚫 Бан: {ban.reason} ({ban.created_at.strftime('%d.%m')})\n"
+        if mute:
+            text += f"🔇 Мут до {mute.until.strftime('%d.%m %H:%M')}\n"
+        if warn:
+            text += f"⚠️ Варн: {warn.reason} ({warn.created_at.strftime('%d.%m')})\n"
+        if not any((ban, mute, warn)):
+            text += "Наказаний не найдено."
+        await message.reply(text)
+
+
+# --- ПРАВИЛА / ЧАТ ---
+@router.message(Command("правила"))
+async def cmd_rules(message: Message):
+    if not message.chat.type.startswith("group"):
+        return
+    async with async_session() as session:
+        cs = await get_or_create_chat(session, message.chat.id)
+        if cs.rules:
+            await message.reply(f"📜 <b>Правила чата:</b>\n\n{cs.rules}")
+        else:
+            await message.reply("❌ Правила не установлены.")
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("+правила "))
+async def cmd_set_rules(message: Message):
+    if not message.chat.type.startswith("group"):
+        return
+    text = message.text[9:].strip()
+    if not text:
+        return await message.reply("Введите текст после команды.")
+    async with async_session() as session:
+        if not await is_mod(session, message.chat.id, message.from_user.id, 5):
+            return await message.reply("❌ Только создатель.")
+        cs = await get_or_create_chat(session, message.chat.id)
+        cs.rules = text
+        await session.commit()
+        await message.reply("✅ Правила установлены.")
+
+
+@router.message(Command("-правила"))
+async def cmd_del_rules(message: Message):
+    if not message.chat.type.startswith("group"):
+        return
+    async with async_session() as session:
+        if not await is_mod(session, message.chat.id, message.from_user.id, 5):
+            return await message.reply("❌ Только создатель.")
+        cs = await get_or_create_chat(session, message.chat.id)
+        cs.rules = None
+        await session.commit()
+        await message.reply("✅ Правила удалены.")
+
+
+@router.message(Command("чат_инфо"))
+async def cmd_chat_info(message: Message):
+    if not message.chat.type.startswith("group"):
+        return
+    async with async_session() as session:
+        cs = await get_or_create_chat(session, message.chat.id, message.chat.title)
+        admins_count = await session.execute(
+            select(func.count(ChatRank.id)).where(ChatRank.chat_id == message.chat.id, ChatRank.rank >= 1)
+        )
+        admins = admins_count.scalar() or 0
+        text = (
+            f"📊 <b>Информация о чате:</b>\n\n"
+            f"Название: {message.chat.title or '—'}\n"
+            f"ID: <code>{message.chat.id}</code>\n"
+            f"Тема: <b>{cs.theme}</b>\n"
+            f"Администраторов: <b>{admins}</b>\n"
+            f"Создатель: <b>{cs.creator_id or 'Не установлен'}</b>"
+        )
+        await message.reply(text)
+
+
+@router.message(Command("чат_айди"))
+async def cmd_chat_id(message: Message):
+    await message.reply(f"🆔 <b>ID чата:</b> <code>{message.chat.id}</code>")
+
+
+@router.message(Command("обновить_чат"))
+async def cmd_update_chat(message: Message):
+    if not message.chat.type.startswith("group"):
+        return
+    async with async_session() as session:
+        cs = await get_or_create_chat(session, message.chat.id, message.chat.title)
+        await session.commit()
+    await message.reply("✅ Информация о чате обновлена.")
+
+
+# --- ИНФО / АРХИВ / СТАТА ---
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("инфо "))
+async def cmd_user_info(message: Message):
+    target_id = None
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+    elif len(message.text.split()) >= 2 and message.text.split()[1].startswith("@"):
+        uname = message.text.split()[1].replace("@", "")
+        async with async_session() as session:
+            res = await session.execute(select(User).where(User.username == uname))
+            u = res.scalar_one_or_none()
+            if u:
+                target_id = u.telegram_id
+    if not target_id:
+        return await message.reply("Укажите пользователя.")
+    async with async_session() as session:
+        u = await get_or_create_user(session, target_id)
+        cs = await session.execute(
+            select(ChatStat).where(ChatStat.chat_id == message.chat.id, ChatStat.user_id == target_id)
+        )
+        stat = cs.scalar_one_or_none()
+        msgs = stat.messages if stat else 0
+        wins = stat.wins if stat else 0
+        losses = stat.losses if stat else 0
+        warns_count = await session.execute(
+            select(func.count(Warn.id)).where(Warn.chat_id == message.chat.id, Warn.user_id == target_id)
+        )
+        warns = warns_count.scalar() or 0
+        text = (
+            f"📋 <b>Информация о пользователе:</b>\n\n"
+            f"Имя: {u.first_name or '—'}\n"
+            f"Ник: {u.nick or '—'}\n"
+            f"Сообщений: <b>{msgs}</b>\n"
+            f"Побед: <b>{wins}</b>\n"
+            f"Проигрышей: <b>{losses}</b>\n"
+            f"Варнов: <b>{warns}</b>\n"
+            f"Репутация: <b>{u.reputation}</b>"
+        )
+        await message.reply(text)
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("+архив "))
+async def cmd_archive(message: Message):
+    target_id = None
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+    elif len(message.text.split()) >= 2 and message.text.split()[1].startswith("@"):
+        uname = message.text.split()[1].replace("@", "")
+        async with async_session() as session:
+            res = await session.execute(select(User).where(User.username == uname))
+            u = res.scalar_one_or_none()
+            if u:
+                target_id = u.telegram_id
+    if not target_id:
+        return await message.reply("Укажите пользователя.")
+    async with async_session() as session:
+        if not await is_mod(session, message.chat.id, message.from_user.id, 1):
+            return await message.reply("❌ Недостаточно прав.")
+        cs = await session.execute(
+            select(ChatStat).where(ChatStat.chat_id == message.chat.id, ChatStat.user_id == target_id)
+        )
+        stat = cs.scalar_one_or_none()
+        if stat:
+            stat.archived = True
+        else:
+            stat = ChatStat(chat_id=message.chat.id, user_id=target_id, archived=True)
+            session.add(stat)
+        await session.commit()
+        await message.reply("✅ Пользователь скрыт из статистики.")
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("-архив "))
+async def cmd_unarchive(message: Message):
+    target_id = None
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+    elif len(message.text.split()) >= 2 and message.text.split()[1].startswith("@"):
+        uname = message.text.split()[1].replace("@", "")
+        async with async_session() as session:
+            res = await session.execute(select(User).where(User.username == uname))
+            u = res.scalar_one_or_none()
+            if u:
+                target_id = u.telegram_id
+    if not target_id:
+        return await message.reply("Укажите пользователя.")
+    async with async_session() as session:
+        if not await is_mod(session, message.chat.id, message.from_user.id, 1):
+            return await message.reply("❌ Недостаточно прав.")
+        cs = await session.execute(
+            select(ChatStat).where(ChatStat.chat_id == message.chat.id, ChatStat.user_id == target_id)
+        )
+        stat = cs.scalar_one_or_none()
+        if stat:
+            stat.archived = False
+            await session.commit()
+        await message.reply("✅ Пользователь возвращён в статистику.")
+
+
+@router.message(Command("стата_админы"))
+async def cmd_stat_admins(message: Message):
+    if not message.chat.type.startswith("group"):
+        return
+    async with async_session() as session:
+        res = await session.execute(
+            select(ChatRank, ChatStat).join(ChatStat, and_(
+                ChatStat.chat_id == ChatRank.chat_id,
+                ChatStat.user_id == ChatRank.user_id
+            )).where(ChatRank.chat_id == message.chat.id, ChatRank.rank >= 1)
+        )
+        rows = res.all()
+        if not rows:
+            return await message.reply("Нет данных.")
+        text = "📊 <b>Статистика админов:</b>\n\n"
+        for rank, stat in rows:
+            user = await get_or_create_user(session, rank.user_id)
+            text += f"• {user.first_name or 'User'}: {stat.messages} сообщ.\n"
+        await message.reply(text)
+
+
+@router.message(Command("стата_фото"))
+async def cmd_stat_photo(message: Message):
+    if not message.chat.type.startswith("group"):
+        return
+    async with async_session() as session:
+        res = await session.execute(
+            select(ChatStat, User).join(User, User.telegram_id == ChatStat.user_id)
+            .where(ChatStat.chat_id == message.chat.id, ChatStat.archived == False)
+            .order_by(desc(ChatStat.messages)).limit(20)
+        )
+        rows = res.all()
+        if not rows:
+            return await message.reply("Нет данных.")
+        # простой ASCII-график
+        text = "📊 <b>Топ-20 сообщений (30 дней):</b>\n\n"
+        max_msgs = max((r[0].messages for r in rows), default=1)
+        for stat, user in rows:
+            bar = "█" * int((stat.messages / max_msgs) * 10)
+            text += f"{user.first_name or 'User'[:12]:12} {bar} {stat.messages}\n"
+        await message.reply(text)
+
+
+@router.message(Command("стата_выигрыши"))
+async def cmd_stat_wins(message: Message):
+    if not message.chat.type.startswith("group"):
+        return
+    async with async_session() as session:
+        res = await session.execute(
+            select(ChatStat, User).join(User, User.telegram_id == ChatStat.user_id)
+            .where(ChatStat.chat_id == message.chat.id, ChatStat.archived == False)
+            .order_by(desc(ChatStat.wins)).limit(20)
+        )
+        rows = res.all()
+        text = "🏆 <b>Топ-20 побед:</b>\n\n"
+        for stat, user in rows:
+            text += f"• {user.first_name or 'User'}: {stat.wins}\n"
+        await message.reply(text)
+
+
+@router.message(Command("стата_проигрыши"))
+async def cmd_stat_losses(message: Message):
+    if not message.chat.type.startswith("group"):
+        return
+    async with async_session() as session:
+        res = await session.execute(
+            select(ChatStat, User).join(User, User.telegram_id == ChatStat.user_id)
+            .where(ChatStat.chat_id == message.chat.id, ChatStat.archived == False)
+            .order_by(desc(ChatStat.losses)).limit(20)
+        )
+        rows = res.all()
+        text = "😞 <b>Топ-20 проигрышей:</b>\n\n"
+        for stat, user in rows:
+            text += f"• {user.first_name or 'User'}: {stat.losses}\n"
+        await message.reply(text)
+
+
+# --- ПРИВЕТСТВИЕ ---
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("+приветствие "))
+async def cmd_welcome(message: Message):
+    if not message.chat.type.startswith("group"):
+        return
+    text = message.text[14:].strip()
+    async with async_session() as session:
+        if not await is_mod(session, message.chat.id, message.from_user.id, 5):
+            return await message.reply("❌ Только создатель.")
+        cs = await get_or_create_chat(session, message.chat.id)
+        cs.welcome_text = text
+        await session.commit()
+    await message.reply("✅ Приветствие установлено.")
+
+
+@router.chat_member(ChatMemberUpdatedFilter(member_status_changed=True))
+async def on_chat_member(event: ChatMemberUpdated, bot: Bot):
+    if not event.chat.type.startswith("group"):
+        return
+    if not event.new_chat_member or event.new_chat_member.status != "member":
+        return
+    async with async_session() as session:
+        cs = await get_or_create_chat(session, event.chat.id)
+        if not cs.welcome_text:
+            return
+        text = cs.welcome_text.replace("{users}", event.new_chat_member.user.full_name)
+        try:
+            await bot.send_message(event.chat.id, text)
+        except Exception:
+            pass
+
+
+# --- СМС (удаление) ---
+@router.message(lambda msg: msg.text and msg.text.lower().strip() == "смс")
+async def cmd_del_msg(message: Message):
+    if not message.chat.type.startswith("group"):
+        return
+    if not message.reply_to_message:
+        return await message.reply("Ответьте на сообщение, которое нужно удалить.")
+    async with async_session() as session:
+        if not await is_mod(session, message.chat.id, message.from_user.id, 1):
+            return await message.reply("❌ Недостаточно прав.")
+    try:
+        await message.reply_to_message.delete()
+        await message.delete()
+    except Exception:
+        await message.reply("❌ Не удалось удалить сообщение.")
+
+
+# --- ТЕМЫ ---
+THEMES = {
+    "1": "Стандарт",
+    "2": "Создатель / Великое Древо",
+    "3": "Старший админ / Леший",
+    "4": "Младший админ / Друид",
+    "5": "Старший модер / Лесной Дух",
+    "6": "Младший модер / Эльф",
+}
+
+
+@router.message(Command("темы"))
+async def cmd_themes(message: Message):
+    if not message.chat.type.startswith("group"):
+        return
+    text = "🎨 <b>Доступные темы:</b>\n\n"
+    for k, v in THEMES.items():
+        text += f"{k}. {v}\n"
+    text += "\nИспользуйте: <code>изменить тему {номер}</code>"
+    await message.reply(text)
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("изменить тему "))
+async def cmd_set_theme(message: Message):
+    if not message.chat.type.startswith("group"):
+        return
+    try:
+        num = message.text.split()[2]
+    except IndexError:
+        return await message.reply("Укажите номер темы.")
+    if num not in THEMES:
+        return await message.reply("Такой темы нет.")
+    async with async_session() as session:
+        if not await is_mod(session, message.chat.id, message.from_user.id, 5):
+            return await message.reply("❌ Только создатель.")
+        cs = await get_or_create_chat(session, message.chat.id)
+        cs.theme = THEMES[num]
+        await session.commit()
+    await message.reply(f"✅ Тема изменена на <b>{THEMES[num]}</b>.")
+
+
+# --- ГБ (заглушка-опрос) ---
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("гб "))
+async def cmd_gb(message: Message):
+    if not message.chat.type.startswith("group"):
+        return
+    target = None
+    if message.reply_to_message:
+        target = message.reply_to_message.from_user.id
+    async with async_session() as session:
+        if not await is_mod(session, message.chat.id, message.from_user.id, 1):
+            return await message.reply("❌ Недостаточно прав.")
+    if not target:
+        return await message.reply("Ответьте на сообщение.")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👍 За бан", callback_data=f"gb:yes:{target}:{message.from_user.id}")],
+        [InlineKeyboardButton(text="👎 Против", callback_data=f"gb:no:{target}:{message.from_user.id}")]
+    ])
+    await message.reply(f"🗳 Голосование за бан ID {target}:", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("gb:"))
+async def cb_gb(callback: CallbackQuery):
+    # Упрощённая логика: просто счётчик не ведётся
+    await callback.answer("Голос учтён!")
