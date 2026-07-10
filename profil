@@ -1,0 +1,343 @@
+from aiogram import Router, F
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command
+from sqlalchemy import select, desc, func
+from database import async_session, User, get_or_create_user, Achievement, Cooldown, ChatStat
+from datetime import datetime, timedelta
+
+router = Router()
+
+
+# --- Профиль ---
+@router.message(Command("профиль"))
+async def cmd_profile(message: Message):
+    target_id = message.from_user.id
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+    async with async_session() as session:
+        user = await get_or_create_user(session, target_id)
+        if not user.profile_public and target_id != message.from_user.id:
+            return await message.reply("🔒 Профиль скрыт.")
+        days = (datetime.utcnow() - user.created_at).days if user.created_at else 0
+        text = (
+            f"👤 <b>Профиль</b>\n\n"
+            f"📝 Ник: <b>{user.nick or user.first_name or 'Нет'}</b>\n"
+            f"📌 Статус: <b>{user.status or 'Нет'}</b>\n"
+            f"⭐ Репутация: <b>{user.reputation}</b>\n"
+        )
+        if user.balance_public or target_id == message.from_user.id:
+            text += (
+                f"💰 Монетки: <b>{user.coins}</b>\n"
+                f"✨ Сияния: <b>{user.sparkles}</b>\n"
+                f"💎 Алмазы: <b>{user.diamonds}</b>\n"
+            )
+        else:
+            text += f"💰 Баланс: <b>🔒 скрыт</b>\n"
+        text += (
+            f"🗡 Кинжалы: <b>{user.daggers}</b>\n"
+            f"🔫 Пистолеты: <b>{user.pistols}</b>\n"
+            f"🏆 VIP: <b>{'Да' if user.vip else 'Нет'}</b>\n"
+            f"📊 Дней в боте: <b>{days}</b>\n"
+            f"💬 Сообщений: <b>{user.messages_count}</b>\n"
+            f"🎖 Награды: <b>{len(user.awards.split(',')) if user.awards else 0}</b>/5"
+        )
+        await message.reply(text)
+
+
+@router.message(Command("+профиль"))
+async def cmd_profile_open(message: Message):
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        user.profile_public = True
+        await session.commit()
+    await message.reply("✅ Профиль теперь <b>публичный</b>.")
+
+
+@router.message(Command("-профиль"))
+async def cmd_profile_close(message: Message):
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        user.profile_public = False
+        await session.commit()
+    await message.reply("🔒 Профиль теперь <b>приватный</b>.")
+
+
+# --- Ник ---
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("+ник "))
+async def cmd_set_nick(message: Message):
+    nick = message.text[5:].strip()
+    if not nick:
+        return await message.reply("Введите ник: <code>+ник НовыйНик</code>")
+    if len(nick) > 30:
+        return await message.reply("❌ Максимум 30 символов.")
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        user.nick = nick
+        await session.commit()
+    await message.reply(f"✅ Ник изменён на <b>{nick}</b>!")
+
+
+@router.message(Command("-ник"))
+async def cmd_remove_nick(message: Message):
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        user.nick = ""
+        await session.commit()
+    await message.reply("✅ Ник удалён.")
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("ник "))
+async def cmd_show_nick(message: Message):
+    target_id = None
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+    elif len(message.text.split()) >= 2 and message.text.split()[1].startswith("@"):
+        uname = message.text.split()[1].replace("@", "")
+        async with async_session() as session:
+            res = await session.execute(select(User).where(User.username == uname))
+            u = res.scalar_one_or_none()
+            if u:
+                target_id = u.telegram_id
+    if not target_id:
+        target_id = message.from_user.id
+    async with async_session() as session:
+        user = await get_or_create_user(session, target_id)
+    await message.reply(f"📝 Ник: <b>{user.nick or 'Не установлен'}</b>")
+
+
+# --- Статус ---
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("+статус "))
+async def cmd_set_status(message: Message):
+    status = message.text[8:].strip()
+    if not status:
+        return await message.reply("Введите статус: <code>+статус мой статус</code>")
+    if len(status) > 50:
+        return await message.reply("❌ Максимум 50 символов.")
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        user.status = status
+        await session.commit()
+    await message.reply(f"✅ Статус установлен: <b>{status}</b>")
+
+
+@router.message(Command("-статус"))
+async def cmd_remove_status(message: Message):
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        user.status = ""
+        await session.commit()
+    await message.reply("✅ Статус удалён.")
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("статус "))
+async def cmd_show_status(message: Message):
+    target_id = None
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+    elif len(message.text.split()) >= 2 and message.text.split()[1].startswith("@"):
+        uname = message.text.split()[1].replace("@", "")
+        async with async_session() as session:
+            res = await session.execute(select(User).where(User.username == uname))
+            u = res.scalar_one_or_none()
+            if u:
+                target_id = u.telegram_id
+    if not target_id:
+        target_id = message.from_user.id
+    async with async_session() as session:
+        user = await get_or_create_user(session, target_id)
+    await message.reply(f"📌 Статус: <b>{user.status or 'Не установлен'}</b>")
+
+
+# --- Баланс visibility ---
+@router.message(Command("+баланс"))
+async def cmd_balance_open(message: Message):
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        user.balance_public = True
+        await session.commit()
+    await message.reply("✅ Баланс теперь <b>виден всем</b>.")
+
+
+@router.message(Command("-баланс"))
+async def cmd_balance_close(message: Message):
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        user.balance_public = False
+        await session.commit()
+    await message.reply("🔒 Баланс теперь <b>скрыт</b>.\nВы автоматически исчезаете из топов.")
+
+
+@router.message(Command("баланс"))
+async def cmd_balance(message: Message):
+    target_id = message.from_user.id
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+    async with async_session() as session:
+        user = await get_or_create_user(session, target_id)
+        if not user.balance_public and target_id != message.from_user.id:
+            return await message.reply("🔒 Баланс пользователя скрыт.")
+        await message.reply(
+            f"💰 <b>Баланс</b>\n\n"
+            f"Монетки: <b>{user.coins}</b>\n"
+            f"Сияния: <b>{user.sparkles}</b>\n"
+            f"Алмазы: <b>{user.diamonds}</b>"
+        )
+
+
+# --- Ачивки ---
+@router.message(Command("мои_ачивки"))
+async def cmd_achievements(message: Message):
+    async with async_session() as session:
+        res = await session.execute(
+            select(Achievement).where(Achievement.user_id == message.from_user.id)
+        )
+        achs = res.scalars().all()
+        if not achs:
+            return await message.reply("🏅 У вас пока нет ачивок.")
+        text = "🏅 <b>Ваши ачивки:</b>\n\n"
+        for a in achs:
+            text += f"{a.emoji} {a.name}\n"
+        await message.reply(text)
+
+
+# --- Топ ---
+@router.message(Command("топ"))
+async def cmd_top(message: Message):
+    async with async_session() as session:
+        res = await session.execute(
+            select(User).where(User.balance_public == True)
+            .order_by(desc(User.coins)).limit(20)
+        )
+        users = res.scalars().all()
+        text = "🏆 <b>Топ-20 по монеткам:</b>\n\n"
+        for i, u in enumerate(users, 1):
+            name = u.nick or u.first_name or f"User {u.telegram_id}"
+            text += f"{i}. {name} — <b>{u.coins}</b>💰\n"
+        await message.reply(text)
+
+
+@router.message(Command("топ_алмазов"))
+async def cmd_top_diamonds(message: Message):
+    async with async_session() as session:
+        res = await session.execute(
+            select(User).where(User.balance_public == True)
+            .order_by(desc(User.diamonds)).limit(20)
+        )
+        users = res.scalars().all()
+        text = "💎 <b>Топ-20 по алмазам:</b>\n\n"
+        for i, u in enumerate(users, 1):
+            name = u.nick or u.first_name or f"User {u.telegram_id}"
+            text += f"{i}. {name} — <b>{u.diamonds}</b>💎\n"
+        await message.reply(text)
+
+
+# --- ID / Инфо ---
+@router.message(Command("ид"))
+async def cmd_id(message: Message):
+    target_id = message.from_user.id
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+    await message.reply(f"🆔 <b>ID:</b> <code>{target_id}</code>")
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("инфо "))
+async def cmd_user_info_chat(message: Message):
+    target_id = None
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+    elif len(message.text.split()) >= 2 and message.text.split()[1].startswith("@"):
+        uname = message.text.split()[1].replace("@", "")
+        async with async_session() as session:
+            res = await session.execute(select(User).where(User.username == uname))
+            u = res.scalar_one_or_none()
+            if u:
+                target_id = u.telegram_id
+    if not target_id:
+        return await message.reply("Укажите пользователя.")
+    async with async_session() as session:
+        u = await get_or_create_user(session, target_id)
+        cs = await session.execute(
+            select(ChatStat).where(ChatStat.chat_id == message.chat.id, ChatStat.user_id == target_id)
+        )
+        stat = cs.scalar_one_or_none()
+        msgs = stat.messages if stat else 0
+        wins = stat.wins if stat else 0
+        losses = stat.losses if stat else 0
+        text = (
+            f"📋 <b>Информация о пользователе:</b>\n\n"
+            f"Имя: {u.first_name or '—'}\n"
+            f"Ник: {u.nick or '—'}\n"
+            f"Сообщений в чате: <b>{msgs}</b>\n"
+            f"Побед: <b>{wins}</b>\n"
+            f"Проигрышей: <b>{losses}</b>\n"
+            f"Репутация: <b>{u.reputation}</b>"
+        )
+        await message.reply(text)
+
+
+# --- VIP ---
+@router.message(Command("вип"))
+async def cmd_vip(message: Message):
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        if user.vip:
+            return await message.reply(
+                "👑 <b>У вас уже есть VIP!</b>\n\n"
+                "Возможности:\n"
+                "• Увеличенные лимиты казино\n"
+                "• x2 монетки в бонусе\n"
+                "• +10 к фарму Сияний\n"
+                "• Без комиссии на переводы\n"
+                "• Создание РП-команд\n"
+                "• Баннер в профиле\n"
+                "• До 5 наград в профиле\n"
+                "• Отключение кулдауна казино"
+            )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💎 Купить VIP", callback_data="vip:buy")]
+    ])
+    await message.reply(
+        "👑 <b>VIP-статус</b>\n\n"
+        "Цена: <b>1000 алмазов</b> (примерно)\n\n"
+        "Чтобы купить, нажмите кнопку ниже.", reply_markup=kb
+    )
+
+
+@router.callback_query(F.data == "vip:buy")
+async def cb_vip_buy(callback: CallbackQuery):
+    async with async_session() as session:
+        user = await get_or_create_user(session, callback.from_user.id)
+        price = 1000
+        if user.diamonds < price:
+            await callback.message.edit_text("❌ Недостаточно алмазов.")
+            return await callback.answer("Недостаточно средств.")
+        user.diamonds -= price
+        user.vip = True
+        await session.commit()
+        await callback.message.edit_text("👑 <b>VIP активирован!</b> Поздравляем!")
+    await callback.answer("Успешно!")
+
+
+# --- Репутация ---
+@router.message(Command("репутация"))
+async def cmd_reputation(message: Message):
+    async with async_session() as session:
+        res = await session.execute(select(User).order_by(desc(User.reputation)).limit(20))
+        top = res.scalars().all()
+        text = "🏆 <b>Топ 20 по репутации:</b>\n\n"
+        for i, u in enumerate(top, 1):
+            name = u.nick or u.first_name or "User"
+            text += f"{i}. {name} — <b>{u.reputation}</b>\n"
+        await message.reply(text)
+
+
+@router.message(Command("репутация_помощь"))
+async def cmd_reputation_help(message: Message):
+    await message.reply(
+        "📈 <b>Как повысить репутацию?</b>\n\n"
+        "• Активность в чатах\n"
+        "• Игры и победы\n"
+        "• Браки и семья\n"
+        "• Питомцы и дуэли\n\n"
+        "Чем выше репутация — тем больше монеток в бонусе!"
+    )
