@@ -1,0 +1,146 @@
+from datetime import datetime
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.orm import declarative_base
+from sqlalchemy import Column, Integer, BigInteger, String, Boolean, DateTime, ForeignKey, Float, Text, select
+
+from config import DB_URL
+
+Base = declarative_base()
+engine = create_async_engine(DB_URL, echo=False)
+async_session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+
+class User(Base):
+    __tablename__ = "users"
+    telegram_id = Column(BigInteger, primary_key=True)
+    username = Column(String(50), nullable=True)
+    first_name = Column(String(100), default="")
+    nick = Column(String(30), default="")
+    status = Column(String(50), default="")
+    reputation = Column(Integer, default=0)
+    coins = Column(BigInteger, default=0)          # Монетки
+    sparkles = Column(BigInteger, default=0)         # Сияния Мики
+    diamonds = Column(BigInteger, default=0)       # Алмазы
+    vip = Column(Boolean, default=False)
+    vip_until = Column(DateTime, nullable=True)
+    profile_public = Column(Boolean, default=True)
+    banner = Column(String, nullable=True)           # file_id баннера
+    awards = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    messages_count = Column(Integer, default=0)
+    daggers = Column(Integer, default=0)             # Кинжалы
+    pistols = Column(Integer, default=0)            # Пистолеты
+    mutes_used_this_month = Column(Integer, default=0)
+    mutes_month = Column(Integer, default=0)
+    level = Column(Integer, default=1)
+    xp = Column(Integer, default=0)
+
+
+class Marriage(Base):
+    __tablename__ = "marriages"
+    id = Column(Integer, primary_key=True)
+    user1_id = Column(BigInteger, ForeignKey("users.telegram_id"))
+    user2_id = Column(BigInteger, ForeignKey("users.telegram_id"))
+    chat_id = Column(BigInteger)
+    married_at = Column(DateTime, default=datetime.utcnow)
+    family_level = Column(Integer, default=1)
+    house_type = Column(String, nullable=True)
+    house_level = Column(Integer, default=0)
+    savings = Column(BigInteger, default=0)
+    interest_rate = Column(Float, default=0.0)
+
+
+class FamilyMember(Base):
+    __tablename__ = "family_members"
+    id = Column(Integer, primary_key=True)
+    family_id = Column(Integer, ForeignKey("marriages.id"))
+    child_id = Column(BigInteger, ForeignKey("users.telegram_id"))
+    role = Column(String, default="child")
+
+
+class Pet(Base):
+    __tablename__ = "pets"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(BigInteger, ForeignKey("users.telegram_id"))
+    name = Column(String, default="Питомец")
+    element = Column(String, default="огонь")
+    level = Column(Integer, default=1)
+    xp = Column(Integer, default=0)
+    health = Column(Integer, default=100)
+    max_health = Column(Integer, default=100)
+    energy = Column(Integer, default=50)
+    max_energy = Column(Integer, default=50)
+    attack = Column(Integer, default=10)
+    defense = Column(Integer, default=5)
+    shield_active = Column(Boolean, default=False)
+    shield_turns = Column(Integer, default=0)
+
+
+class InventoryItem(Base):
+    __tablename__ = "inventory"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(BigInteger, ForeignKey("users.telegram_id"))
+    item_name = Column(String)
+    quantity = Column(Integer, default=0)
+
+
+class RPCommand(Base):
+    __tablename__ = "rp_commands"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(BigInteger, ForeignKey("users.telegram_id"))
+    name = Column(String)
+    emoji = Column(String)
+    action = Column(String)
+    media_type = Column(String, nullable=True)
+    media_id = Column(String, nullable=True)
+
+
+class Cooldown(Base):
+    __tablename__ = "cooldowns"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(BigInteger)
+    command = Column(String)
+    chat_id = Column(BigInteger, nullable=True)
+    expires_at = Column(DateTime)
+
+
+class MuteRecord(Base):
+    __tablename__ = "mutes"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(BigInteger)
+    chat_id = Column(BigInteger)
+    muted_by = Column(BigInteger)
+    until = Column(DateTime)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class GameState(Base):
+    __tablename__ = "game_states"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(BigInteger)
+    game_type = Column(String)
+    state_data = Column(Text)
+    bet = Column(BigInteger, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+async def init_db():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+
+async def get_or_create_user(session: AsyncSession, telegram_id: int,
+                             username: str = None, first_name: str = ""):
+    result = await session.execute(select(User).where(User.telegram_id == telegram_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        user = User(telegram_id=telegram_id, username=username, first_name=first_name)
+        session.add(user)
+        await session.commit()
+    else:
+        if username and user.username != username:
+            user.username = username
+        if first_name and user.first_name != first_name:
+            user.first_name = first_name
+        await session.commit()
+    return user
