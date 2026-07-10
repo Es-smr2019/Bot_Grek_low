@@ -1,0 +1,176 @@
+from aiogram import Router, F
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command
+from sqlalchemy import select, desc, and_
+from database import async_session, get_or_create_user, Car, GameState
+import random
+import json
+
+router = Router()
+
+CARS_SHOP = {
+    "седан": {"coins": 5000, "type": "асфальт", "pass": 40, "speed": 70, "fuel": 80},
+    "внедорожник": {"coins": 15000, "type": "гравий", "pass": 80, "speed": 50, "fuel": 100},
+    "монстр": {"coins": 25000, "type": "гористая", "pass": 90, "speed": 35, "fuel": 120},
+}
+
+TRACKS = {
+    "асфальт": {"need": 30, "penalty": 0},
+    "гравий": {"need": 60, "penalty": 30},
+    "гористая": {"need": 80, "penalty": 40},
+}
+
+
+async def get_car(session, user_id):
+    res = await session.execute(select(Car).where(Car.user_id == user_id))
+    return res.scalar_one_or_none()
+
+
+@router.message(Command("магазин_машин"))
+async def cmd_car_shop(message: Message):
+    text = "🏎 <b>Магазин машин:</b>\n\n"
+    for name, data in CARS_SHOP.items():
+        text += (
+            f"• <b>{name}</b> — {data['coins']}💰\n"
+            f"  Тип: {data['type']}, Проходимость: {data['pass']}, Скорость: {data['speed']}\n\n"
+        )
+    text += "Купить: <code>+машина {название}</code>"
+    await message.reply(text)
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("+машина "))
+async def cmd_buy_car(message: Message):
+    name = message.text[9:].strip().lower()
+    if name not in CARS_SHOP:
+        return await message.reply("Такой машины нет.")
+    data = CARS_SHOP[name]
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        if user.coins < data["coins"]:
+            return await message.reply("❌ Недостаточно монеток.")
+        existing = await get_car(session, message.from_user.id)
+        if existing:
+            return await message.reply("❌ У вас уже есть машина. Сначала продайте.")
+        user.coins -= data["coins"]
+        car = Car(
+            user_id=message.from_user.id, car_name=name, car_type=data["type"],
+            passability=data["pass"], speed=data["speed"], max_fuel=data["fuel"], fuel=data["fuel"]
+        )
+        session.add(car)
+        await session.commit()
+    await message.reply(f"✅ Вы купили <b>{name}</b>!")
+
+
+@router.message(Command("моя_машина"))
+async def cmd_my_car(message: Message):
+    async with async_session() as session:
+        car = await get_car(session, message.from_user.id)
+        if not car:
+            return await message.reply("❌ У вас нет машины. <code>магазин_машин</code>")
+        text = (
+            f"🏎 <b>{car.car_name}</b>\n"
+            f"Тип: {car.car_type}\n"
+            f"Проходимость: {car.passability}\n"
+            f"Скорость: {car.speed}\n"
+            f"Топливо: {car.fuel}/{car.max_fuel}\n"
+            f"Побед: {car.wins} | Гонок: {car.races}"
+        )
+        await message.reply(text)
+
+
+def calc_race_speed(car, track_name):
+    track = TRACKS[track_name]
+    bonus = car.passability - track["need"]
+    if bonus >= 0:
+        speed = car.speed + random.randint(-10, 20) + (bonus // 2)
+    else:
+        speed = car.speed - track["penalty"] + random.randint(-10, 10)
+    return max(10, speed)
+
+
+@router.message(Command("гонки"))
+async def cmd_race_bot(message: Message):
+    async with async_session() as session:
+        car = await get_car(session, message.from_user.id)
+        if not car:
+            return await message.reply("❌ Купите машину.")
+        if car.fuel < 20:
+            return await message.reply("⛽ Недостаточно топлива. Купите в магазине.")
+        track = random.choice(list(TRACKS.keys()))
+        car.fuel -= 20
+        car.races += 1
+        # бот машина
+        bot_car = random.choice(list(CARS_SHOP.values()))
+        bot_speed = bot_car["speed"] + random.randint(-10, 20)
+        if bot_car["pass"] < TRACKS[track]["need"]:
+            bot_speed -= TRACKS[track]["penalty"]
+        player_speed = calc_race_speed(car, track)
+        if player_speed > bot_speed:
+            car.wins += 1
+            prize = 500
+            user = await get_or_create_user(session, message.from_user.id)
+            user.coins += prize
+            res = f"🎉 <b>Победа!</b> +{prize} монеток"
+        else:
+            res = "😞 Поражение..."
+        await session.commit()
+    text = (
+        f"🏁 <b>Гонка на {track}!</b>\n\n"
+        f"Ваша скорость: <b>{player_speed}</b>\n"
+        f"Соперник: <b>{bot_speed}</b>\n\n"
+        f"{res}"
+    )
+    await message.reply(text)
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("заезд "))
+async def cmd_race_pvp(message: Message):
+    if not message.reply_to_message:
+        return await message.reply("Ответьте на сообщение соперника.")
+    target_id = message.reply_to_message.from_user.id
+    async with async_session() as session:
+        car1 = await get_car(session, message.from_user.id)
+        car2 = await get_car(session, target_id)
+        if not car1 or not car2:
+            return await message.reply("Оба участника должны иметь машины.")
+        if car1.fuel < 20 or car2.fuel < 20:
+            return await message.reply("У одного из участников мало топлива.")
+        track = random.choice(list(TRACKS.keys()))
+        car1.fuel -= 20
+        car2.fuel -= 20
+        car1.races += 1
+        car2.races += 1
+        s1 = calc_race_speed(car1, track)
+        s2 = calc_race_speed(car2, track)
+        if s1 > s2:
+            car1.wins += 1
+            winner = message.from_user.full_name
+        elif s2 > s1:
+            car2.wins += 1
+            winner = message.reply_to_message.from_user.full_name
+        else:
+            winner = "Ничья!"
+        await session.commit()
+    text = (
+        f"🏁 <b>Заезд на {track}!</b>\n\n"
+        f"{message.from_user.full_name}: <b>{s1}</b>\n"
+        f"{message.reply_to_message.from_user.full_name}: <b>{s2}</b>\n\n"
+        f"🎉 Победитель: <b>{winner}</b>"
+    )
+    await message.reply(text)
+
+
+@router.message(Command("топ_гонщиков"))
+async def cmd_top_racers(message: Message):
+    async with async_session() as session:
+        res = await session.execute(
+            select(Car, User).join(User, User.telegram_id == Car.user_id)
+            .order_by(desc(Car.wins)).limit(20)
+        )
+        rows = res.all()
+        if not rows:
+            return await message.reply("Пока нет гонщиков.")
+        text = "🏆 <b>Топ гонщиков:</b>\n\n"
+        for i, (car, user) in enumerate(rows, 1):
+            text += f"{i}. {user.first_name or 'User'} — {car.wins} побед\n"
+        await message.reply(text)
