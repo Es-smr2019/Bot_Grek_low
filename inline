@@ -1,0 +1,21 @@
+from aiogram import Router
+from aiogram.types import InlineQuery, InlineQueryResultArticle, InputTextMessageContent
+
+router = Router()
+
+
+@router.inline_query()
+async def inline_handler(inline_query: InlineQuery):
+    results = [
+        InlineQueryResultArticle(
+            id="1",
+            title="👋 Приветствие",
+            input_message_content=InputTextMessageContent(message_text="Привет! Я Мики 🦊")
+        ),
+        InlineQueryResultArticle(
+            id="2",
+            title="❤️ Признание",
+            input_message_content=InputTextMessageContent(message_text="Я тебя люблю! ❤️")
+        ),
+    ]
+    await inline_query.answer(results, cache_time=1)
