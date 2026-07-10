@@ -18,18 +18,19 @@ class User(Base):
     nick = Column(String(30), default="")
     status = Column(String(50), default="")
     reputation = Column(Integer, default=0)
-    coins = Column(BigInteger, default=0)          # Монетки
-    sparkles = Column(BigInteger, default=0)         # Сияния Мики
-    diamonds = Column(BigInteger, default=0)       # Алмазы
+    coins = Column(BigInteger, default=0)
+    sparkles = Column(BigInteger, default=0)
+    diamonds = Column(BigInteger, default=0)
     vip = Column(Boolean, default=False)
     vip_until = Column(DateTime, nullable=True)
     profile_public = Column(Boolean, default=True)
-    banner = Column(String, nullable=True)           # file_id баннера
-    awards = Column(Integer, default=0)
+    balance_public = Column(Boolean, default=True)
+    banner = Column(String, nullable=True)
+    awards = Column(Text, default="")          # JSON-массив наград
     created_at = Column(DateTime, default=datetime.utcnow)
     messages_count = Column(Integer, default=0)
-    daggers = Column(Integer, default=0)             # Кинжалы
-    pistols = Column(Integer, default=0)            # Пистолеты
+    daggers = Column(Integer, default=0)
+    pistols = Column(Integer, default=0)
     mutes_used_this_month = Column(Integer, default=0)
     mutes_month = Column(Integer, default=0)
     level = Column(Integer, default=1)
@@ -124,6 +125,95 @@ class GameState(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class Theft(Base):
+    __tablename__ = "thefts"
+    id = Column(Integer, primary_key=True)
+    thief_id = Column(BigInteger)
+    target_id = Column(BigInteger)
+    chat_id = Column(BigInteger)
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+# --- NEW: Машины, модерация, чаты, ачивки ---
+
+class Car(Base):
+    __tablename__ = "cars"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(BigInteger, ForeignKey("users.telegram_id"))
+    car_name = Column(String, default="Бугатти")
+    car_type = Column(String, default="асфальт")   # асфальт, гравий, гористая
+    passability = Column(Integer, default=50)
+    speed = Column(Integer, default=50)
+    fuel = Column(Integer, default=100)
+    max_fuel = Column(Integer, default=100)
+    wins = Column(Integer, default=0)
+    races = Column(Integer, default=0)
+
+
+class ChatSettings(Base):
+    __tablename__ = "chat_settings"
+    chat_id = Column(BigInteger, primary_key=True)
+    chat_title = Column(String, nullable=True)
+    welcome_text = Column(String, nullable=True)
+    rules = Column(Text, nullable=True)
+    theme = Column(String, default="стандарт")
+    warn_limit = Column(Integer, default=3)
+    warn_action = Column(String, default="mute")   # ban/mute/kick
+    warn_duration = Column(String, default="1ч")    # для mute
+    creator_id = Column(BigInteger, nullable=True)
+    commands_disabled = Column(Text, default="")
+
+
+class ChatRank(Base):
+    __tablename__ = "chat_ranks"
+    id = Column(Integer, primary_key=True)
+    chat_id = Column(BigInteger)
+    user_id = Column(BigInteger)
+    rank = Column(Integer, default=0)   # 0-5
+
+
+class Warn(Base):
+    __tablename__ = "warns"
+    id = Column(Integer, primary_key=True)
+    chat_id = Column(BigInteger)
+    user_id = Column(BigInteger)
+    reason = Column(String, default="")
+    warned_by = Column(BigInteger)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Ban(Base):
+    __tablename__ = "bans"
+    id = Column(Integer, primary_key=True)
+    chat_id = Column(BigInteger)
+    user_id = Column(BigInteger)
+    reason = Column(String, default="")
+    banned_by = Column(BigInteger)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Achievement(Base):
+    __tablename__ = "achievements"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(BigInteger, ForeignKey("users.telegram_id"))
+    name = Column(String)
+    emoji = Column(String, default="🏅")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ChatStat(Base):
+    __tablename__ = "chat_stats"
+    id = Column(Integer, primary_key=True)
+    chat_id = Column(BigInteger)
+    user_id = Column(BigInteger)
+    messages = Column(Integer, default=0)
+    wins = Column(Integer, default=0)
+    losses = Column(Integer, default=0)
+    archived = Column(Boolean, default=False)
+    last_active = Column(DateTime, default=datetime.utcnow)
+
+
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -144,3 +234,45 @@ async def get_or_create_user(session: AsyncSession, telegram_id: int,
             user.first_name = first_name
         await session.commit()
     return user
+
+
+async def get_or_create_chat(session: AsyncSession, chat_id: int, title: str = None):
+    result = await session.execute(select(ChatSettings).where(ChatSettings.chat_id == chat_id))
+    cs = result.scalar_one_or_none()
+    if not cs:
+        cs = ChatSettings(chat_id=chat_id, chat_title=title)
+        session.add(cs)
+        await session.commit()
+    elif title and cs.chat_title != title:
+        cs.chat_title = title
+        await session.commit()
+    return cs
+
+
+async def is_robbed(session: AsyncSession, user_id: int):
+    result = await session.execute(
+        select(Theft).where(Theft.target_id == user_id, Theft.active == True)
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def get_chat_rank(session: AsyncSession, chat_id: int, user_id: int):
+    result = await session.execute(
+        select(ChatRank).where(ChatRank.chat_id == chat_id, ChatRank.user_id == user_id)
+    )
+    r = result.scalar_one_or_none()
+    return r.rank if r else 0
+
+
+async def set_chat_rank(session: AsyncSession, chat_id: int, user_id: int, rank: int):
+    result = await session.execute(
+        select(ChatRank).where(ChatRank.chat_id == chat_id, ChatRank.user_id == user_id)
+    )
+    r = result.scalar_one_or_none()
+    if r:
+        r.rank = rank
+    else:
+        r = ChatRank(chat_id=chat_id, user_id=user_id, rank=rank)
+        session.add(r)
+    await session.commit()
+    return r
