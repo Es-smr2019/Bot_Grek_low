@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8685175228:AAFWvXipsknxCmIUiCSLkB8YuaHcJOnn2Bs")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_USERNAME = "MisedOwner"
 DB_URL = os.getenv("DB_URL", "sqlite+aiosqlite:///miki_bot.db")
 
