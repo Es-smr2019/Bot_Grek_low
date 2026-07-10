@@ -1,0 +1,140 @@
+from aiogram import Router
+from aiogram.types import Message
+from aiogram.filters import Command
+from sqlalchemy import select
+from database import async_session, User, get_or_create_user, RPCommand
+
+router = Router()
+
+# Встроенные РП-команды
+BUILTIN_RP = {
+    "обнять": "обнял",
+    "ударить": "ударил",
+    "поцеловать": "поцеловал",
+    "выебать": "выебал",
+    "изнасиловать": "изнасиловал",
+    "сжечь": "сжёг",
+    "булочка": "скормил булочку",
+    "пнуть": "пнул",
+    "кастрировать": "кастрировал",
+    "кончить": "кончил на",
+    "щёчки": "потёр щёчки",
+    "убить": "убил",
+    "отсосать": "отсосал у",
+    "отлизать": "отлизал у",
+    "кусь": "куснул",
+    "куснуть": "куснул",
+    "укусить": "укусил",
+    "погладить": "погладил",
+    "засосать": "засосал",
+    "плюнуть": "плюнул в",
+    "пожмякать": "пожмякал",
+    "подрочить": "подрочил",
+    "пицца": "угостил пиццей",
+    "трахнуть": "трахнул",
+    "секс": "занялся сексом с",
+    "отдаться": "отдался",
+    "сырок": "дал сырок",
+    "обоссать": "обоссал",
+    "уебать": "уебал",
+    "отпиздить": "отпиздил",
+    "стхуярить": "стхуярил",
+    "вафля": "сделал вафлю",
+    "послать": "послал нахуй",
+    "влюбиться": "влюбился в",
+    "толкнуть": "толкнул",
+    "облизать": "облизал",
+    "задонатить": "задонатил",
+    "соблазнить": "соблазнил",
+}
+
+
+@router.message(Command("мои_рп"))
+async def cmd_my_rp(message: Message):
+    async with async_session() as session:
+        result = await session.execute(
+            select(RPCommand).where(RPCommand.user_id == message.from_user.id)
+        )
+        cmds = result.scalars().all()
+        if not cmds:
+            return await message.reply("У вас нет кастомных РП-команд.")
+        text = "📝 <b>Ваши РП:</b>\n\n"
+        for c in cmds:
+            text += f"• {c.name} {c.emoji} {c.action}\n"
+        await message.reply(text)
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("+рп "))
+async def cmd_add_rp(message: Message):
+    # +рп название/эмодзи/действие
+    text = message.text[4:].strip()
+    parts = text.split("/")
+    if len(parts) < 3:
+        return await message.reply("Формат: +рп название/эмодзи/действие")
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        if not user.vip and not message.from_user.username == "MisedOwner":
+            # Считаем количество
+            count_res = await session.execute(
+                select(RPCommand).where(RPCommand.user_id == user.telegram_id)
+            )
+            if len(count_res.scalars().all()) >= 15:
+                return await message.reply("❌ Лимит 15 РП-команд. Купите VIP.")
+        cmd = RPCommand(
+            user_id=user.telegram_id,
+            name=parts[0].strip().lower(),
+            emoji=parts[1].strip(),
+            action=parts[2].strip()
+        )
+        session.add(cmd)
+        await session.commit()
+    await message.reply(f"✅ РП-команда '<b>{parts[0]}</b>' добавлена!")
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("-рп "))
+async def cmd_del_rp(message: Message):
+    name = message.text[4:].strip().lower()
+    async with async_session() as session:
+        result = await session.execute(
+            select(RPCommand).where(
+                RPCommand.user_id == message.from_user.id,
+                RPCommand.name == name
+            )
+        )
+        cmd = result.scalar_one_or_none()
+        if not cmd:
+            return await message.reply("Команда не найдена.")
+        await session.delete(cmd)
+        await session.commit()
+    await message.reply(f"❌ РП-команда '<b>{name}</b>' удалена.")
+
+
+# Обработчик РП в чатах (только как ответ)
+@router.message(lambda msg: msg.text and msg.reply_to_message and msg.chat.type in ("group", "supergroup"))
+async def rp_handler(message: Message):
+    text = message.text.lower().strip()
+    words = text.split()
+    if not words:
+        return
+    cmd_name = words[0].strip()
+    # Сначала ищем кастомные
+    async with async_session() as session:
+        result = await session.execute(
+            select(RPCommand).where(RPCommand.name == cmd_name)
+        )
+        custom = result.scalar_one_or_none()
+        if custom:
+            action = custom.action
+            emoji = custom.emoji
+        else:
+            if cmd_name in BUILTIN_RP:
+                action = BUILTIN_RP[cmd_name]
+                emoji = ""
+            else:
+                return
+    sender = message.from_user.full_name
+    target = message.reply_to_message.from_user.full_name
+    if emoji:
+        await message.reply(f"{emoji} | {sender} {action} {target}")
+    else:
+        await message.reply(f"{sender} {action} {target}")
