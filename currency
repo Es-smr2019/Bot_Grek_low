@@ -1,0 +1,300 @@
+from aiogram import Router
+from aiogram.types import Message
+from aiogram.filters import Command
+from sqlalchemy import select
+from database import async_session, User, get_or_create_user, Cooldown, is_robbed
+from config import (
+    DEFAULT_BONUS_COINS_MIN, DEFAULT_BONUS_COINS_MAX,
+    DEFAULT_BONUS_SPARKLES_MIN, DEFAULT_BONUS_SPARKLES_MAX,
+    VIP_BONUS_MULTIPLIER, VIP_BONUS_SPARKLES_EXTRA,
+    CONVERT_DIAMONDS_TO_COINS_RATE, CONVERT_DIAMONDS_TO_SPARKLES_RATE,
+    ITEM_TRANSFER_COST_SPARKLES
+)
+import random
+import re
+from datetime import datetime, timedelta
+
+router = Router()
+
+
+def get_bonus_amount(user: User):
+    coins = random.randint(DEFAULT_BONUS_COINS_MIN, DEFAULT_BONUS_COINS_MAX)
+    sparkles = random.randint(DEFAULT_BONUS_SPARKLES_MIN, DEFAULT_BONUS_SPARKLES_MAX)
+    if user.vip:
+        coins *= VIP_BONUS_MULTIPLIER
+        sparkles += VIP_BONUS_SPARKLES_EXTRA
+    coins += user.reputation // 10
+    return coins, sparkles
+
+
+@router.message(Command("бонус"))
+async def cmd_bonus(message: Message):
+    async with async_session() as session:
+        user = await get_or_create_user(
+            session, message.from_user.id,
+            message.from_user.username, message.from_user.first_name
+        )
+        now = datetime.utcnow()
+        result = await session.execute(
+            select(Cooldown).where(
+                Cooldown.user_id == user.telegram_id,
+                Cooldown.command == "bonus"
+            )
+        )
+        cd = result.scalar_one_or_none()
+        if cd and cd.expires_at > now:
+            left = cd.expires_at - now
+            h = int(left.total_seconds() // 3600)
+            m = int((left.total_seconds() % 3600) // 60)
+            return await message.reply(f"⏳ Бонус доступен через <b>{h}ч {m}м</b>.")
+        coins, sparkles = get_bonus_amount(user)
+        user.coins += coins
+        user.sparkles += sparkles
+        if not cd:
+            cd = Cooldown(
+                user_id=user.telegram_id, command="bonus",
+                expires_at=now + timedelta(hours=24)
+            )
+            session.add(cd)
+        else:
+            cd.expires_at = now + timedelta(hours=24)
+        await session.commit()
+        vip_tag = " (VIP x2)" if user.vip else ""
+        await message.reply(
+            f"🎁 <b>Ежедневный бонус получен!</b>{vip_tag}\n"
+            f"💰 Монеток: <b>+{coins}</b>\n"
+            f"✨ Сияний Мики: <b>+{sparkles}</b>\n"
+            f"📈 От репутации: <b>+{user.reputation // 10}</b> монеток"
+        )
+
+
+# --- Передача монеток: +{число} ---
+@router.message(lambda msg: msg.text and re.match(r'^\+\d+(\s|$)', msg.text))
+async def transfer_coins(message: Message):
+    match = re.match(r'\+(\d+)', message.text)
+    amount = int(match.group(1))
+    if not message.reply_to_message:
+        return await message.reply("Ответьте на сообщение пользователя, чтобы передать монетки.")
+    if amount <= 0:
+        return
+    target = message.reply_to_message.from_user.id
+    async with async_session() as session:
+        sender = await get_or_create_user(session, message.from_user.id)
+        if await is_robbed(session, sender.telegram_id):
+            return await message.reply("❌ На вас нападают! Нельзя переводить валюту.")
+        receiver = await get_or_create_user(session, target)
+        if sender.coins < amount:
+            return await message.reply("❌ Недостаточно монеток.")
+        commission = 0
+        if not sender.vip:
+            commission = max(1, amount // 10)
+        total = amount + commission
+        if sender.coins < total:
+            return await message.reply(
+                f"❌ Нужно {total} монеток (включая комиссию {commission})."
+            )
+        sender.coins -= total
+        receiver.coins += amount
+        await session.commit()
+        comm_text = f" (комиссия {commission})" if commission else ""
+        await message.reply(
+            f"💸 Вы передали <b>{amount}</b> монеток{comm_text} пользователю "
+            f"{message.reply_to_message.from_user.full_name}."
+        )
+
+
+# --- Передача алмазов: передать {число} ---
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("передать "))
+async def transfer_diamonds(message: Message):
+    parts = message.text.split()
+    if len(parts) < 2:
+        return
+    try:
+        amount = int(parts[1])
+    except ValueError:
+        return
+    target = None
+    if message.reply_to_message:
+        target = message.reply_to_message.from_user.id
+    else:
+        if len(parts) >= 3 and parts[2].startswith("@"):
+            uname = parts[2].replace("@", "")
+            async with async_session() as session:
+                result = await session.execute(select(User).where(User.username == uname))
+                u = result.scalar_one_or_none()
+                if u:
+                    target = u.telegram_id
+    if not target:
+        return await message.reply("Ответьте на сообщение или укажите @username.")
+    async with async_session() as session:
+        sender = await get_or_create_user(session, message.from_user.id)
+        if await is_robbed(session, sender.telegram_id):
+            return await message.reply("❌ На вас нападают! Нельзя переводить валюту.")
+        receiver = await get_or_create_user(session, target)
+        if sender.diamonds < amount:
+            return await message.reply("❌ Недостаточно алмазов.")
+        sender.diamonds -= amount
+        receiver.diamonds += amount
+        await session.commit()
+        await message.reply(f"💎 Вы передали <b>{amount}</b> алмазов.")
+
+
+# --- Передача Сияний: +сияния {число} ---
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("+сияния "))
+async def transfer_sparkles(message: Message):
+    parts = message.text.split()
+    if len(parts) < 2:
+        return
+    try:
+        amount = int(parts[1])
+    except ValueError:
+        return
+    target = None
+    if message.reply_to_message:
+        target = message.reply_to_message.from_user.id
+    else:
+        if len(parts) >= 3 and parts[2].startswith("@"):
+            uname = parts[2].replace("@", "")
+            async with async_session() as session:
+                result = await session.execute(select(User).where(User.username == uname))
+                u = result.scalar_one_or_none()
+                if u:
+                    target = u.telegram_id
+    if not target:
+        return await message.reply("Ответьте на сообщение или укажите @username.")
+    async with async_session() as session:
+        sender = await get_or_create_user(session, message.from_user.id)
+        if await is_robbed(session, sender.telegram_id):
+            return await message.reply("❌ На вас нападают! Нельзя переводить валюту.")
+        receiver = await get_or_create_user(session, target)
+        if sender.sparkles < amount:
+            return await message.reply("❌ Недостаточно Сияний Мики.")
+        sender.sparkles -= amount
+        receiver.sparkles += amount
+        await session.commit()
+        await message.reply(f"✨ Вы передали <b>{amount}</b> Сияний Мики.")
+
+
+# --- Передача кинжалов: +кинжал {число} ---
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("+кинжал "))
+async def transfer_daggers(message: Message):
+    parts = message.text.split()
+    if len(parts) < 2:
+        return
+    try:
+        amount = int(parts[1])
+    except ValueError:
+        return
+    target = None
+    if message.reply_to_message:
+        target = message.reply_to_message.from_user.id
+    else:
+        if len(parts) >= 3 and parts[2].startswith("@"):
+            uname = parts[2].replace("@", "")
+            async with async_session() as session:
+                result = await session.execute(select(User).where(User.username == uname))
+                u = result.scalar_one_or_none()
+                if u:
+                    target = u.telegram_id
+    if not target:
+        return await message.reply("Ответьте на сообщение или укажите @username.")
+    cost = amount * ITEM_TRANSFER_COST_SPARKLES
+    async with async_session() as session:
+        sender = await get_or_create_user(session, message.from_user.id)
+        if await is_robbed(session, sender.telegram_id):
+            return await message.reply("❌ На вас нападают! Нельзя переводить предметы.")
+        receiver = await get_or_create_user(session, target)
+        if sender.daggers < amount:
+            return await message.reply("❌ Недостаточно кинжалов.")
+        if sender.sparkles < cost:
+            return await message.reply(f"❌ Нужно <b>{cost}</b> Сияний Мики за передачу.")
+        sender.daggers -= amount
+        sender.sparkles -= cost
+        receiver.daggers += amount
+        await session.commit()
+        await message.reply(
+            f"🗡 Передано <b>{amount}</b> кинжалов (стоимость: {cost} Сияний)."
+        )
+
+
+# --- Передача пистолетов: +пистолет {число} ---
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("+пистолет "))
+async def transfer_pistols(message: Message):
+    parts = message.text.split()
+    if len(parts) < 2:
+        return
+    try:
+        amount = int(parts[1])
+    except ValueError:
+        return
+    target = None
+    if message.reply_to_message:
+        target = message.reply_to_message.from_user.id
+    else:
+        if len(parts) >= 3 and parts[2].startswith("@"):
+            uname = parts[2].replace("@", "")
+            async with async_session() as session:
+                result = await session.execute(select(User).where(User.username == uname))
+                u = result.scalar_one_or_none()
+                if u:
+                    target = u.telegram_id
+    if not target:
+        return await message.reply("Ответьте на сообщение или укажите @username.")
+    cost = amount * ITEM_TRANSFER_COST_SPARKLES
+    async with async_session() as session:
+        sender = await get_or_create_user(session, message.from_user.id)
+        if await is_robbed(session, sender.telegram_id):
+            return await message.reply("❌ На вас нападают! Нельзя переводить предметы.")
+        receiver = await get_or_create_user(session, target)
+        if sender.pistols < amount:
+            return await message.reply("❌ Недостаточно пистолетов.")
+        if sender.sparkles < cost:
+            return await message.reply(f"❌ Нужно <b>{cost}</b> Сияний Мики за передачу.")
+        sender.pistols -= amount
+        sender.sparkles -= cost
+        receiver.pistols += amount
+        await session.commit()
+        await message.reply(
+            f"🔫 Передано <b>{amount}</b> пистолетов (стоимость: {cost} Сияний)."
+        )
+
+
+# --- Конвертация ---
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("конвертировать с "))
+async def convert_sparkles(message: Message):
+    parts = message.text.split()
+    if len(parts) < 3:
+        return
+    try:
+        amount = int(parts[2])
+    except ValueError:
+        return
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        if user.diamonds < amount:
+            return await message.reply("❌ Недостаточно алмазов.")
+        got = amount * CONVERT_DIAMONDS_TO_SPARKLES_RATE
+        user.diamonds -= amount
+        user.sparkles += got
+        await session.commit()
+        await message.reply(f"💎➡✨ Конвертировано <b>{amount}</b> алмазов в <b>{got}</b> Сияний.")
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("конвертировать "))
+async def convert_coins(message: Message):
+    parts = message.text.split()
+    if len(parts) < 2:
+        return
+    try:
+        amount = int(parts[1])
+    except ValueError:
+        return
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        if user.diamonds < amount:
+            return await message.reply("❌ Недостаточно алмазов.")
+        got = amount * CONVERT_DIAMONDS_TO_COINS_RATE
+        user.diamonds -= amount
+        user.coins += got
+        await session.commit()
+        await message.reply(f"💎➡💰 Конвертировано <b>{amount}</b> алмазов в <b>{got}</b> монеток.")
