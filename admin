@@ -1,0 +1,68 @@
+from aiogram import Router, Bot
+from aiogram.types import Message
+from aiogram.filters import Command
+from sqlalchemy import select
+from database import async_session, User, get_or_create_user, MuteRecord
+from config import MUTE_COST_DIAMONDS, MUTE_DURATION_HOURS, MAX_MUTES_PER_MONTH
+from datetime import datetime, timedelta
+
+router = Router()
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("/молчать "))
+async def cmd_mute(message: Message, bot: Bot):
+    if not message.reply_to_message:
+        return await message.reply("Ответьте на сообщение пользователя, которого нужно заглушить.")
+    target_id = message.reply_to_message.from_user.id
+    async with async_session() as session:
+        sender = await get_or_create_user(session, message.from_user.id)
+        target = await get_or_create_user(session, target_id)
+        # Проверка уровня (1 и 2 ранг)
+        if target.level > 2:
+            return await message.reply("❌ Можно заглушить только пользователей с 1 и 2 рангом.")
+        if sender.diamonds < MUTE_COST_DIAMONDS:
+            return await message.reply(f"❌ Нужно <b>{MUTE_COST_DIAMONDS}</b> алмазов.")
+        # Лимит в месяц
+        now = datetime.utcnow()
+        if sender.mutes_month != now.month:
+            sender.mutes_month = now.month
+            sender.mutes_used_this_month = 0
+        if sender.mutes_used_this_month >= MAX_MUTES_PER_MONTH:
+            return await message.reply("❌ Лимит заглушений в этом месяце исчерпан (3 раза).")
+        sender.diamonds -= MUTE_COST_DIAMONDS
+        sender.mutes_used_this_month += 1
+        until = now + timedelta(hours=MUTE_DURATION_HOURS)
+        # Пробуем ограничить в чате (если бот админ)
+        try:
+            await bot.restrict_chat_member(
+                chat_id=message.chat.id,
+                user_id=target_id,
+                permissions={"can_send_messages": False, "can_send_media_messages": False},
+                until_date=until
+            )
+        except Exception:
+            pass
+        mute = MuteRecord(user_id=target_id, chat_id=message.chat.id, muted_by=sender.telegram_id, until=until)
+        session.add(mute)
+        await session.commit()
+    await message.reply(
+        f"🔇 <b>Пользователь заглушён</b> на {MUTE_DURATION_HOURS} часа(ов).\n"
+        f"Осталось заглушений в этом месяце: <b>{MAX_MUTES_PER_MONTH - sender.mutes_used_this_month}</b>"
+    )
+
+
+@router.message(Command("проверить_муты"))
+async def cmd_check_mutes(message: Message):
+    async with async_session() as session:
+        result = await session.execute(
+            select(MuteRecord).where(MuteRecord.user_id == message.from_user.id)
+        )
+        mutes = result.scalars().all()
+        if not mutes:
+            return await message.reply("🔊 На вас нет активных мутов.")
+        text = "🔇 <b>Активные муты:</b>\n\n"
+        for m in mutes:
+            if m.until > datetime.utcnow():
+                left = m.until - datetime.utcnow()
+                text += f"• Чат {m.chat_id}: ещё {int(left.total_seconds()//3600)}ч\n"
+        await message.reply(text)
