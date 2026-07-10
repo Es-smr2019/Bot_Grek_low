@@ -627,3 +627,391 @@ async def cmd_defend(message: Message):
             "🔫 <b>Вы отбились!</b>\n"
             "Пистолет спас вас. Теперь вы можете играть и переводить валюту."
         )
+
+
+# ========================
+#  КРЕСТИКИ-НОЛИКИ (КН)
+# ========================
+
+def ttt_board_kb(board, size, game_id, disabled=False):
+    emojis = {"X": "❌", "O": "⭕", " ": "⬜"}
+    kb = []
+    for row in range(size):
+        r = []
+        for col in range(size):
+            idx = row * size + col
+            val = board[idx]
+            if disabled or val != " ":
+                r.append(InlineKeyboardButton(text=emojis[val], callback_data=f"ttt:none:{game_id}"))
+            else:
+                r.append(InlineKeyboardButton(text=emojis[val], callback_data=f"ttt:{idx}:{game_id}"))
+        kb.append(r)
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def ttt_check_winner(board, size, need=3):
+    # only for 3x3 default, 5x5 need=4
+    lines = []
+    for r in range(size):
+        for c in range(size - need + 1):
+            lines.append([r * size + c + i for i in range(need)])
+    for c in range(size):
+        for r in range(size - need + 1):
+            lines.append([(r + i) * size + c for i in range(need)])
+    for r in range(size - need + 1):
+        for c in range(size - need + 1):
+            lines.append([(r + i) * size + (c + i) for i in range(need)])
+            lines.append([(r + i) * size + (c + need - 1 - i) for i in range(need)])
+    for line in lines:
+        vals = [board[i] for i in line]
+        if vals[0] != " " and all(v == vals[0] for v in vals):
+            return vals[0], line
+    return None, []
+
+
+async def ttt_bot_move(board, size, need=3):
+    free = [i for i, v in enumerate(board) if v == " "]
+    if not free:
+        return None
+    # try win
+    for idx in free:
+        board[idx] = "O"
+        w, _ = ttt_check_winner(board, size, need)
+        board[idx] = " "
+        if w == "O":
+            return idx
+    # block
+    for idx in free:
+        board[idx] = "X"
+        w, _ = ttt_check_winner(board, size, need)
+        board[idx] = " "
+        if w == "X":
+            return idx
+    return random.choice(free)
+
+
+@router.message(lambda msg: msg.text and (msg.text.lower().startswith("кн3 ") or msg.text.lower().startswith("кн5 ") or msg.text.lower() == "кн3" or msg.text.lower() == "кн5"))
+async def cmd_ttt(message: Message):
+    text = message.text.lower().strip()
+    size = 3 if text.startswith("кн3") else 5
+    need = 3 if size == 3 else 4
+    bet = 0
+    parts = message.text.split()
+    if len(parts) >= 2:
+        try:
+            bet = int(parts[1])
+        except ValueError:
+            bet = 0
+    # PvP via reply
+    pvp = bool(message.reply_to_message)
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        if bet > 0:
+            ok, err = await can_play_async(user, bet, 999_999_999)
+            if not ok:
+                return await message.reply(err)
+        board = [" "] * (size * size)
+        state = {
+            "type": "ttt", "size": size, "need": need, "board": board,
+            "turn": "X", "bet": bet, "pvp": pvp,
+            "player_x": message.from_user.id,
+            "player_o": message.reply_to_message.from_user.id if pvp else 0,
+            "alive": True, "message_id": None
+        }
+        if pvp:
+            state["phase"] = "waiting_o"  # wait for O to accept
+        gs = GameState(user_id=message.from_user.id, game_type="ttt", state_data=json.dumps(state), bet=bet)
+        session.add(gs)
+        await session.commit()
+        if pvp:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Принять вызов", callback_data=f"ttt:accept:{gs.id}")]
+            ])
+            await message.reply(
+                f"❌ <b>Крестики-нолики {size}x{size}</b>\n"
+                f"Вызов от {message.from_user.full_name}!\n"
+                f"Ставка: {bet} монеток. {message.reply_to_message.from_user.full_name}, жмите кнопку!",
+                reply_markup=kb
+            )
+        else:
+            await message.reply(
+                f"❌ <b>Крестики-нолики {size}x{size}</b> (vs Бот)\nВаш ход!",
+                reply_markup=ttt_board_kb(board, size, gs.id)
+            )
+
+
+@router.callback_query(F.data.startswith("ttt:accept:"))
+async def cb_ttt_accept(callback: CallbackQuery):
+    game_id = int(callback.data.split(":")[2])
+    async with async_session() as session:
+        gs = await session.get(GameState, game_id)
+        if not gs or gs.game_type != "ttt":
+            return await callback.answer("Игра не найдена.")
+        state = json.loads(gs.state_data)
+        if state.get("player_o") != callback.from_user.id:
+            return await callback.answer("Это не ваш вызов!")
+        if state.get("phase") != "waiting_o":
+            return await callback.answer("Уже началась.")
+        state["phase"] = "playing"
+        state["turn"] = "X"
+        gs.state_data = json.dumps(state)
+        await session.commit()
+        await callback.message.edit_text(
+            f"❌ <b>Крестики-нолики {state['size']}x{state['size']}</b>\n"
+            f"Ход: X ({state['player_x']})",
+            reply_markup=ttt_board_kb(state["board"], state["size"], gs.id)
+        )
+    await callback.answer("Поехали!")
+
+
+@router.callback_query(F.data.startswith("ttt:"))
+async def cb_ttt(callback: CallbackQuery):
+    parts = callback.data.split(":")
+    if parts[1] == "none":
+        return await callback.answer()
+    if parts[1] == "accept":
+        return  # handled above
+    idx = int(parts[1])
+    game_id = int(parts[2])
+    async with async_session() as session:
+        gs = await session.get(GameState, game_id)
+        if not gs or gs.game_type != "ttt":
+            return await callback.answer("Игра не найдена.")
+        state = json.loads(gs.state_data)
+        if not state["alive"]:
+            return await callback.answer("Игра окончена.")
+        board = state["board"]
+        size = state["size"]
+        need = state["need"]
+        turn = state["turn"]
+        pvp = state["pvp"]
+        # check whose turn
+        current_player = state["player_x"] if turn == "X" else state["player_o"]
+        if pvp and callback.from_user.id != current_player:
+            return await callback.answer("Сейчас не ваш ход!")
+        if not pvp and turn != "X":
+            return await callback.answer("Подождите...")
+        if board[idx] != " ":
+            return await callback.answer("Клетка занята.")
+        board[idx] = turn
+        winner, line = ttt_check_winner(board, size, need)
+        if winner:
+            state["alive"] = False
+            gs.state_data = json.dumps(state)
+            await session.delete(gs)
+            await session.commit()
+            kb = ttt_board_kb(board, size, game_id, disabled=True)
+            # payout
+            if pvp:
+                win_id = state["player_x"] if winner == "X" else state["player_o"]
+                loser_id = state["player_o"] if winner == "X" else state["player_x"]
+                if gs.bet > 0:
+                    win_user = await get_or_create_user(session, win_id)
+                    lose_user = await get_or_create_user(session, loser_id)
+                    win_user.coins += gs.bet
+                    lose_user.coins -= gs.bet
+                    await session.commit()
+                await callback.message.edit_text(
+                    f"🏆 <b>Победил {winner}!</b>\nИгра окончена.", reply_markup=kb
+                )
+            else:
+                if winner == "X":
+                    if gs.bet > 0:
+                        user = await get_or_create_user(session, state["player_x"])
+                        user.coins += gs.bet
+                        await session.commit()
+                    await callback.message.edit_text(
+                        f"🎉 <b>Вы победили!</b> +{gs.bet} монеток", reply_markup=kb
+                    )
+                else:
+                    if gs.bet > 0:
+                        user = await get_or_create_user(session, state["player_x"])
+                        user.coins -= gs.bet
+                        await session.commit()
+                    await callback.message.edit_text(
+                        f"😞 <b>Бот победил!</b> -{gs.bet} монеток", reply_markup=kb
+                    )
+            return await callback.answer("Конец!")
+        if " " not in board:
+            state["alive"] = False
+            gs.state_data = json.dumps(state)
+            await session.delete(gs)
+            await session.commit()
+            await callback.message.edit_text(
+                "😐 <b>Ничья!</b>", reply_markup=ttt_board_kb(board, size, game_id, disabled=True)
+            )
+            return await callback.answer("Ничья!")
+        if pvp:
+            state["turn"] = "O" if turn == "X" else "X"
+            gs.state_data = json.dumps(state)
+            await session.commit()
+            next_name = "X" if state["turn"] == "X" else "O"
+            await callback.message.edit_text(
+                f"❌ <b>Крестики-нолики {size}x{size}</b>\nХод: {next_name}",
+                reply_markup=ttt_board_kb(board, size, game_id)
+            )
+            return await callback.answer("Ход сделан!")
+        else:
+            # bot turn
+            state["turn"] = "O"
+            gs.state_data = json.dumps(state)
+            await session.commit()
+            await callback.message.edit_text(
+                f"❌ <b>Крестики-нолики {size}x{size}</b>\nБот думает...",
+                reply_markup=ttt_board_kb(board, size, game_id)
+            )
+            move = await ttt_bot_move(board, size, need)
+            if move is not None:
+                board[move] = "O"
+            winner, line = ttt_check_winner(board, size, need)
+            if winner == "O":
+                state["alive"] = False
+                gs.state_data = json.dumps(state)
+                await session.delete(gs)
+                await session.commit()
+                if gs.bet > 0:
+                    user = await get_or_create_user(session, state["player_x"])
+                    user.coins -= gs.bet
+                    await session.commit()
+                await callback.message.edit_text(
+                    f"😞 <b>Бот победил!</b> -{gs.bet} монеток",
+                    reply_markup=ttt_board_kb(board, size, game_id, disabled=True)
+                )
+                return await callback.answer("Проигрыш!")
+            if " " not in board:
+                state["alive"] = False
+                gs.state_data = json.dumps(state)
+                await session.delete(gs)
+                await session.commit()
+                await callback.message.edit_text(
+                    "😐 <b>Ничья!</b>", reply_markup=ttt_board_kb(board, size, game_id, disabled=True)
+                )
+                return await callback.answer("Ничья!")
+            state["turn"] = "X"
+            gs.state_data = json.dumps(state)
+            await session.commit()
+            await callback.message.edit_text(
+                f"❌ <b>Крестики-нолики {size}x{size}</b>\nВаш ход!",
+                reply_markup=ttt_board_kb(board, size, game_id)
+            )
+            return await callback.answer("Ход бота!")
+
+
+# ========================
+#  ФОРТУНА
+# ========================
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("фортуна "))
+async def cmd_fortune(message: Message):
+    parts = message.text.split()
+    if len(parts) < 2:
+        return await message.reply("Использование: фортуна <ставка>")
+    try:
+        bet = int(parts[1])
+    except ValueError:
+        return
+    if bet <= 0:
+        return
+    if not message.chat.type.startswith("group"):
+        return await message.reply("Фортуна работает только в группах.")
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        if user.coins < bet:
+            return await message.reply("❌ Недостаточно монеток.")
+        state = {
+            "phase": "joining", "bet": bet, "players": [message.from_user.id],
+            "starter": message.from_user.id, "chat_id": message.chat.id
+        }
+        gs = GameState(user_id=message.from_user.id, game_type="fortune", state_data=json.dumps(state), bet=bet)
+        session.add(gs)
+        await session.commit()
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎲 Присоединиться", callback_data=f"fortune:join:{gs.id}")]
+        ])
+        await message.reply(
+            f"🎲 <b>Фортуна!</b> Ставка: {bet} монеток.\n"
+            f"Набор участников: 1/10\n"
+            f"У вас есть 60 секунд!",
+            reply_markup=kb
+        )
+        # Auto-resolve after 60s (naive: user can start early by another command? We skip timer for simplicity, or handle via cron)
+        # For simplicity, we add a manual start button
+        start_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="▶ Начать раньше", callback_data=f"fortune:start:{gs.id}")]
+        ])
+        await message.reply("Нажмите кнопку, когда все присоединятся:", reply_markup=start_kb)
+
+
+@router.callback_query(F.data.startswith("fortune:join:"))
+async def cb_fortune_join(callback: CallbackQuery):
+    game_id = int(callback.data.split(":")[2])
+    async with async_session() as session:
+        gs = await session.get(GameState, game_id)
+        if not gs or gs.game_type != "fortune":
+            return await callback.answer("Игра не найдена.")
+        state = json.loads(gs.state_data)
+        if state["phase"] != "joining":
+            return await callback.answer("Набор закончен.")
+        if callback.from_user.id in state["players"]:
+            return await callback.answer("Вы уже в игре!")
+        user = await get_or_create_user(session, callback.from_user.id)
+        if user.coins < gs.bet:
+            return await callback.answer("Недостаточно монеток!")
+        state["players"].append(callback.from_user.id)
+        gs.state_data = json.dumps(state)
+        await session.commit()
+        await callback.message.edit_text(
+            f"🎲 <b>Фортуна!</b> Ставка: {gs.bet} монеток.\n"
+            f"Набор участников: {len(state['players'])}/10\n"
+            f"У вас есть 60 секунд!",
+            reply_markup=callback.message.reply_markup
+        )
+    await callback.answer("Вы присоединились!")
+
+
+@router.callback_query(F.data.startswith("fortune:start:"))
+async def cb_fortune_start(callback: CallbackQuery):
+    game_id = int(callback.data.split(":")[2])
+    async with async_session() as session:
+        gs = await session.get(GameState, game_id)
+        if not gs or gs.game_type != "fortune":
+            return await callback.answer("Игра не найдена.")
+        state = json.loads(gs.state_data)
+        if state["phase"] != "joining":
+            return await callback.answer("Уже началась.")
+        if callback.from_user.id != state["starter"]:
+            return await callback.answer("Только организатор может начать.")
+        players = state["players"]
+        if len(players) < 3:
+            return await callback.answer("Нужно минимум 3 участника!")
+        state["phase"] = "playing"
+        gs.state_data = json.dumps(state)
+        await session.commit()
+        # Roll dice for each
+        rolls = {}
+        for uid in players:
+            rolls[uid] = random.randint(1, 6)
+        sorted_players = sorted(rolls.items(), key=lambda x: x[1], reverse=True)
+        winners = sorted_players[:2]
+        pot = gs.bet * len(players)
+        prize = pot // 2
+        # deduct bets from all
+        for uid in players:
+            u = await get_or_create_user(session, uid)
+            u.coins -= gs.bet
+        # give prizes
+        for uid, roll in winners:
+            u = await get_or_create_user(session, uid)
+            u.coins += prize
+        await session.delete(gs)
+        await session.commit()
+        text = "🎲 <b>Фортуна — результаты:</b>\n\n"
+        for uid, roll in sorted_players:
+            u = await get_or_create_user(session, uid)
+            text += f"• {u.first_name or 'User'}: 🎲 {roll}\n"
+        text += f"\n🏆 <b>Победители (топ-2):</b>\n"
+        for uid, roll in winners:
+            u = await get_or_create_user(session, uid)
+            text += f"• {u.first_name or 'User'} — +{prize} монеток\n"
+        await callback.message.edit_text(text)
+    await callback.answer("Игра завершена!")
