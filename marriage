@@ -1,0 +1,479 @@
+from aiogram import Router, F
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command
+from sqlalchemy import select, and_, or_
+from database import async_session, User, get_or_create_user, Marriage, FamilyMember
+import random
+from datetime import datetime, timedelta
+
+router = Router()
+
+
+# --- Брак ---
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("брак "))
+async def cmd_marry(message: Message):
+    if not message.reply_to_message and len(message.text.split()) < 2:
+        return await message.reply("Укажите пользователя: брак @username или ответьте на сообщение.")
+    target_id = None
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+    else:
+        uname = message.text.split()[1].replace("@", "")
+        async with async_session() as session:
+            result = await session.execute(select(User).where(User.username == uname))
+            u = result.scalar_one_or_none()
+            if u:
+                target_id = u.telegram_id
+    if not target_id or target_id == message.from_user.id:
+        return await message.reply("Некорректная цель.")
+    async with async_session() as session:
+        proposer = await get_or_create_user(session, message.from_user.id)
+        # Проверка: уже в браке?
+        existing = await session.execute(
+            select(Marriage).where(
+                or_(
+                    and_(Marriage.user1_id == proposer.telegram_id, Marriage.user2_id == target_id),
+                    and_(Marriage.user1_id == target_id, Marriage.user2_id == proposer.telegram_id),
+                    or_(
+                        Marriage.user1_id == proposer.telegram_id,
+                        Marriage.user2_id == proposer.telegram_id
+                    )
+                )
+            )
+        )
+        if existing.scalar_one_or_none():
+            return await message.reply("❌ Один из вас уже в браке.")
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💍 Согласиться", callback_data=f"marry:yes:{proposer.telegram_id}")],
+            [InlineKeyboardButton(text="❌ Отказаться", callback_data=f"marry:no:{proposer.telegram_id}")]
+        ])
+        await message.reply(
+            f"💍 <a href='tg://user?id={proposer.telegram_id}'>Пользователь</a> "
+            f"предлагает вам вступить в брак!", reply_markup=kb
+        )
+
+
+@router.callback_query(F.data.startswith("marry:"))
+async def cb_marry(callback: CallbackQuery):
+    parts = callback.data.split(":")
+    action = parts[1]
+    proposer_id = int(parts[2])
+    if callback.from_user.id == proposer_id:
+        return await callback.answer("Это не для вас.")
+    if action == "no":
+        await callback.message.edit_text("❌ Предложение отклонено.")
+        return await callback.answer("Отклонено.")
+    async with async_session() as session:
+        # check again
+        existing = await session.execute(
+            select(Marriage).where(
+                or_(
+                    Marriage.user1_id == proposer_id,
+                    Marriage.user2_id == proposer_id,
+                    Marriage.user1_id == callback.from_user.id,
+                    Marriage.user2_id == callback.from_user.id
+                )
+            )
+        )
+        if existing.scalar_one_or_none():
+            return await callback.message.edit_text("❌ Кто-то уже в браке.")
+        marriage = Marriage(
+            user1_id=proposer_id, user2_id=callback.from_user.id,
+            chat_id=callback.message.chat.id
+        )
+        session.add(marriage)
+        await session.commit()
+        await callback.message.edit_text(
+            f"🎉 <b>Свадьба!</b>\n"
+            f"<a href='tg://user?id={proposer_id}'>Жених</a> + "
+            f"<a href='tg://user?id={callback.from_user.id}'>Невеста</a> = ❤️"
+        )
+        await callback.answer("Поздравляем!")
+
+
+@router.message(Command("браки"))
+async def cmd_marriages(message: Message):
+    async with async_session() as session:
+        result = await session.execute(
+            select(Marriage).where(Marriage.chat_id == message.chat.id)
+        )
+        marriages = result.scalars().all()
+        if not marriages:
+            return await message.reply("В этом чате пока нет браков.")
+        text = "💍 <b>Браки в чате:</b>\n\n"
+        for m in marriages:
+            u1 = await session.execute(select(User).where(User.telegram_id == m.user1_id))
+            u2 = await session.execute(select(User).where(User.telegram_id == m.user2_id))
+            user1 = u1.scalar_one_or_none()
+            user2 = u2.scalar_one_or_none()
+            name1 = user1.first_name or "User" if user1 else "User"
+            name2 = user2.first_name or "User" if user2 else "User"
+            text += f"• {name1} ❤️ {name2}\n"
+        await message.reply(text)
+
+
+@router.message(Command("мой_брак"))
+async def cmd_my_marriage(message: Message):
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        result = await session.execute(
+            select(Marriage).where(
+                or_(
+                    Marriage.user1_id == user.telegram_id,
+                    Marriage.user2_id == user.telegram_id
+                )
+            )
+        )
+        m = result.scalar_one_or_none()
+        if not m:
+            return await message.reply("Вы не состоите в браке.")
+        partner_id = m.user2_id if m.user1_id == user.telegram_id else m.user1_id
+        partner = await get_or_create_user(session, partner_id)
+        await message.reply(
+            f"💍 <b>Ваш брак</b>\n\n"
+            f"Партнёр: {partner.first_name or 'User'}\n"
+            f"Уровень семьи: <b>{m.family_level}</b>\n"
+            f"Сбережения: <b>{m.savings}</b>\n"
+            f"Дом: <b>{m.house_type or 'Нет'}</b>"
+        )
+
+
+@router.message(Command("развод"))
+async def cmd_divorce(message: Message):
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        result = await session.execute(
+            select(Marriage).where(
+                or_(
+                    Marriage.user1_id == user.telegram_id,
+                    Marriage.user2_id == user.telegram_id
+                )
+            )
+        )
+        m = result.scalar_one_or_none()
+        if not m:
+            return await message.reply("Вы не в браке.")
+        await session.delete(m)
+        # удаляем детей
+        await session.execute(
+            select(FamilyMember).where(FamilyMember.family_id == m.id)
+        )
+        await session.commit()
+        await message.reply("💔 <b>Брак расторгнут.</b>")
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("развести пару "))
+async def cmd_divorce_other(message: Message):
+    # Команда для владельца/админа
+    if not message.reply_to_message:
+        return await message.reply("Ответьте на сообщение одного из супругов.")
+    target_id = message.reply_to_message.from_user.id
+    async with async_session() as session:
+        result = await session.execute(
+            select(Marriage).where(
+                or_(
+                    Marriage.user1_id == target_id,
+                    Marriage.user2_id == target_id
+                )
+            )
+        )
+        m = result.scalar_one_or_none()
+        if not m:
+            return await message.reply("Этот пользователь не в браке.")
+        await session.delete(m)
+        await session.commit()
+        await message.reply("💔 <b>Чужой брак расторгнут.</b>")
+
+
+# --- Семья: дети ---
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("+сын "))
+async def cmd_add_son(message: Message):
+    if not message.reply_to_message:
+        return await message.reply("Ответьте на сообщение ребёнка.")
+    child_id = message.reply_to_message.from_user.id
+    async with async_session() as session:
+        parent = await get_or_create_user(session, message.from_user.id)
+        m = await session.execute(
+            select(Marriage).where(
+                or_(
+                    Marriage.user1_id == parent.telegram_id,
+                    Marriage.user2_id == parent.telegram_id
+                )
+            )
+        )
+        marriage = m.scalar_one_or_none()
+        if not marriage:
+            return await message.reply("❌ Сначала нужно вступить в брак.")
+        # проверка, не состоит ли уже в семье
+        existing = await session.execute(
+            select(FamilyMember).where(FamilyMember.child_id == child_id)
+        )
+        if existing.scalar_one_or_none():
+            return await message.reply("Этот пользователь уже в семье.")
+        fm = FamilyMember(family_id=marriage.id, child_id=child_id, role="son")
+        session.add(fm)
+        await session.commit()
+        await message.reply("👦 Сын принят в семью!")
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("+дочь "))
+async def cmd_add_daughter(message: Message):
+    if not message.reply_to_message:
+        return await message.reply("Ответьте на сообщение ребёнка.")
+    child_id = message.reply_to_message.from_user.id
+    async with async_session() as session:
+        parent = await get_or_create_user(session, message.from_user.id)
+        m = await session.execute(
+            select(Marriage).where(
+                or_(
+                    Marriage.user1_id == parent.telegram_id,
+                    Marriage.user2_id == parent.telegram_id
+                )
+            )
+        )
+        marriage = m.scalar_one_or_none()
+        if not marriage:
+            return await message.reply("❌ Сначала нужно вступить в брак.")
+        existing = await session.execute(
+            select(FamilyMember).where(FamilyMember.child_id == child_id)
+        )
+        if existing.scalar_one_or_none():
+            return await message.reply("Этот пользователь уже в семье.")
+        fm = FamilyMember(family_id=marriage.id, child_id=child_id, role="daughter")
+        session.add(fm)
+        await session.commit()
+        await message.reply("👧 Дочь принята в семью!")
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("-ребенок "))
+async def cmd_remove_child(message: Message):
+    if not message.reply_to_message:
+        return await message.reply("Ответьте на сообщение ребёнка.")
+    child_id = message.reply_to_message.from_user.id
+    async with async_session() as session:
+        parent = await get_or_create_user(session, message.from_user.id)
+        m = await session.execute(
+            select(Marriage).where(
+                or_(
+                    Marriage.user1_id == parent.telegram_id,
+                    Marriage.user2_id == parent.telegram_id
+                )
+            )
+        )
+        marriage = m.scalar_one_or_none()
+        if not marriage:
+            return await message.reply("Вы не в браке.")
+        result = await session.execute(
+            select(FamilyMember).where(
+                FamilyMember.family_id == marriage.id,
+                FamilyMember.child_id == child_id
+            )
+        )
+        fm = result.scalar_one_or_none()
+        if fm:
+            await session.delete(fm)
+            await session.commit()
+            await message.reply("❌ Ребёнок исключён из семьи.")
+        else:
+            await message.reply("❌ Этот пользователь не в вашей семье.")
+
+
+@router.message(Command("выйти_из_семьи"))
+async def cmd_leave_family(message: Message):
+    async with async_session() as session:
+        result = await session.execute(
+            select(FamilyMember).where(FamilyMember.child_id == message.from_user.id)
+        )
+        fm = result.scalar_one_or_none()
+        if fm:
+            await session.delete(fm)
+            await session.commit()
+            await message.reply("👋 Вы покинули семью.")
+        else:
+            await message.reply("Вы не в семье как ребёнок.")
+
+
+@router.message(Command("моя_семья"))
+async def cmd_my_family(message: Message):
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        m = await session.execute(
+            select(Marriage).where(
+                or_(
+                    Marriage.user1_id == user.telegram_id,
+                    Marriage.user2_id == user.telegram_id
+                )
+            )
+        )
+        marriage = m.scalar_one_or_none()
+        if not marriage:
+            return await message.reply("Вы не в браке.")
+        children_res = await session.execute(
+            select(FamilyMember).where(FamilyMember.family_id == marriage.id)
+        )
+        children = children_res.scalars().all()
+        text = f"👨‍👩‍👧‍👦 <b>Семья</b>\nУровень: <b>{marriage.family_level}</b>\nСбережения: <b>{marriage.savings}</b>\n\n"
+        if children:
+            text += "Дети:\n"
+            for c in children:
+                child = await get_or_create_user(session, c.child_id)
+                text += f"• {child.first_name or 'User'} ({c.role})\n"
+        else:
+            text += "Детей пока нет."
+        await message.reply(text)
+
+
+# --- Сбережения ---
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("+сбережения "))
+async def cmd_deposit(message: Message):
+    parts = message.text.split()
+    if len(parts) < 2:
+        return
+    try:
+        amount = int(parts[1])
+    except ValueError:
+        return
+    if amount <= 0:
+        return
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        m = await session.execute(
+            select(Marriage).where(
+                or_(
+                    Marriage.user1_id == user.telegram_id,
+                    Marriage.user2_id == user.telegram_id
+                )
+            )
+        )
+        marriage = m.scalar_one_or_none()
+        if not marriage:
+            return await message.reply("❌ Сначала вступите в брак.")
+        if user.coins < amount:
+            return await message.reply("❌ Недостаточно монеток.")
+        user.coins -= amount
+        marriage.savings += amount
+        await session.commit()
+        await message.reply(f"✅ Внесено <b>{amount}</b> монеток в сбережения.")
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("-сбережения "))
+async def cmd_withdraw(message: Message):
+    parts = message.text.split()
+    if len(parts) < 2:
+        return
+    try:
+        amount = int(parts[1])
+    except ValueError:
+        return
+    if amount <= 0:
+        return
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        m = await session.execute(
+            select(Marriage).where(
+                or_(
+                    Marriage.user1_id == user.telegram_id,
+                    Marriage.user2_id == user.telegram_id
+                )
+            )
+        )
+        marriage = m.scalar_one_or_none()
+        if not marriage:
+            return await message.reply("❌ Нет брака.")
+        if marriage.savings < amount:
+            return await message.reply("❌ Недостаточно средств на сбережениях.")
+        # Упрощённо: сразу снимаем (в оригинале нужно согласие второй половинки)
+        marriage.savings -= amount
+        user.coins += amount
+        await session.commit()
+        await message.reply(f"✅ Снято <b>{amount}</b> монеток со сбережений.")
+
+
+# --- Дома ---
+@router.message(Command("купить_дом"))
+async def cmd_buy_house(message: Message):
+    # Упрощённая реализация: 3 уровня домов
+    houses = {
+        "шалаш": {"coins": 5000, "sparkles": 0, "diamonds": 0, "rate": 0.01},
+        "домик": {"coins": 20000, "sparkles": 50, "diamonds": 0, "rate": 0.03},
+        "особняк": {"coins": 100000, "sparkles": 200, "diamonds": 5, "rate": 0.05},
+    }
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        m = await session.execute(
+            select(Marriage).where(
+                or_(
+                    Marriage.user1_id == user.telegram_id,
+                    Marriage.user2_id == user.telegram_id
+                )
+            )
+        )
+        marriage = m.scalar_one_or_none()
+        if not marriage:
+            return await message.reply("❌ Только для семей.")
+        if marriage.house_type:
+            return await message.reply("❌ У вас уже есть дом. Используйте /улучшить_дом")
+        text = "🏡 <b>Дома:</b>\n\n"
+        for name, data in houses.items():
+            text += (
+                f"• <b>{name}</b>: {data['coins']}💰 {data['sparkles']}✨ {data['diamonds']}💎\n"
+                f"  Ставка: +{int(data['rate']*100)}% в субботу\n"
+            )
+        text += "\nИспользуйте: <code>+дом [название]</code>"
+        await message.reply(text)
+
+
+@router.message(lambda msg: msg.text and msg.text.lower().startswith("+дом "))
+async def cmd_buy_house_select(message: Message):
+    houses = {
+        "шалаш": {"coins": 5000, "sparkles": 0, "diamonds": 0, "rate": 0.01},
+        "домик": {"coins": 20000, "sparkles": 50, "diamonds": 0, "rate": 0.03},
+        "особняк": {"coins": 100000, "sparkles": 200, "diamonds": 5, "rate": 0.05},
+    }
+    name = message.text.split()[1].lower()
+    if name not in houses:
+        return await message.reply("Такого дома нет.")
+    data = houses[name]
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        m = await session.execute(
+            select(Marriage).where(
+                or_(
+                    Marriage.user1_id == user.telegram_id,
+                    Marriage.user2_id == user.telegram_id
+                )
+            )
+        )
+        marriage = m.scalar_one_or_none()
+        if not marriage:
+            return await message.reply("❌ Только для семей.")
+        if marriage.house_type:
+            return await message.reply("У вас уже есть дом.")
+        if user.coins < data["coins"] or user.sparkles < data["sparkles"] or user.diamonds < data["diamonds"]:
+            return await message.reply("❌ Недостаточно средств.")
+        user.coins -= data["coins"]
+        user.sparkles -= data["sparkles"]
+        user.diamonds -= data["diamonds"]
+        marriage.house_type = name
+        marriage.interest_rate = data["rate"]
+        await session.commit()
+        await message.reply(f"🏡 <b>Дом '{name}'</b> куплен! Ставка: +{int(data['rate']*100)}%")
+
+
+# --- Проценты по субботам (можно запускать вручную или по таймеру) ---
+@router.message(Command("начислить_проценты"))
+async def cmd_interest(message: Message):
+    # Упрощённая команда для демонстрации (в идеале через APScheduler)
+    if datetime.utcnow().weekday() != 5:
+        return await message.reply("Суббота? Нет. Но для теста можно форсировать владельцу.")
+    async with async_session() as session:
+        result = await session.execute(select(Marriage))
+        marriages = result.scalars().all()
+        count = 0
+        for m in marriages:
+            if m.savings > 0 and m.interest_rate > 0:
+                bonus = int(m.savings * m.interest_rate)
+                m.savings += bonus
+                count += 1
+        await session.commit()
+    await message.reply(f"✅ Начислено процентов для <b>{count}</b> семей.")
